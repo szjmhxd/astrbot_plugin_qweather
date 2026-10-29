@@ -1,24 +1,37 @@
 """和风天气订阅推送插件。
 
-功能
+指令
 ----
-``/天气``　　　查当前地址的天气
-``/地址``　　　管理多个地址，每个地址有独立的推送方案
-``/天气推送``　定时推送规则（每天、每周、每月、每小时、日出日落）
-``/雨雪提醒``　降水开始 / 结束提醒，可配多个可提醒时段
-``/预警推送``　灾害预警轮询，同一条不重复推、等级升高再推
-``/key``　　　本会话专用凭据（分步引导），可随时恢复系统默认
-``/额度``　　　账户余额与最近 24 小时请求量
+所有指令都挂在一条主指令下，前缀可配（默认 ``qweather``，不允许为空）：
+
+``/qweather 天气``　查当前地址的天气，也可以在这里改 / 清除地址
+``/qweather 地址``　管理多个地址，每个地址有独立的推送方案
+``/qweather 推送``　定时推送规则（每天、每周、每月、每小时、日出日落）
+``/qweather 雨雪``　降水开始 / 结束提醒，可配多个可提醒时段
+``/qweather 预警``　灾害预警轮询，同一条不重复推、等级升高再推
+``/qweather key``　 本会话专用凭据（分步引导），可随时恢复系统默认
+``/qweather 额度``　账户余额与最近 24 小时请求量
+
+为什么不做无前缀指令
+--------------------
+``/天气`` 这种裸指令太容易和别的天气插件撞名：AstrBot 会把同一条消息投给所有匹
+配的 handler，用户会收到两份回答。所以整族指令收在一条主指令下，前缀写进配置，
+改它有用、留空无效（空等于把撞名问题还回去）。
 
 开发约定
 --------
-所有 ``@filter.*`` 必须写在 ``main.py`` 的插件类里。AstrBot 用 ``handler_module_path``
-精确匹配 handler 归属，写在其它模块会被静默丢弃——这个坑在本地天气插件上踩过。
+``@filter.command`` 的指令名在 import 时就定死了，配置项改不动它。这里改用「一条
+消息处理器 + 自己解析前缀」：``@filter.event_message_type(ALL)`` 拿全部消息，前缀
+不匹配立刻 return，不拦别的插件也不拦 LLM。已核对 AstrBot 的 WakingCheckStage /
+ProcessStage：LLM 只在 ``is_at_or_wake_command`` 为真且没有发送过消息时才会被调用，
+所以这个 ALL 处理器不会让机器人变得有问必答（pending 输入本来也是这么做的）。
+
+另外：所有 ``@filter.*`` 必须写在 ``main.py`` 的插件类里。AstrBot 用
+``handler_module_path`` 精确匹配 handler 归属，写在其它模块会被静默丢弃。
 """
 
 from __future__ import annotations
 
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -27,7 +40,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from .qw import render
+from .qw import naming, render
 from .qw.client import QWeatherClient, QWeatherError, coord_error, looks_like_coord, parse_latlon
 from .qw.commands import Commands, join_place
 from .qw.keys import KeyStore, KeyWizard
@@ -36,34 +49,6 @@ from .qw.store import SubStore
 
 PLUGIN_NAME = "astrbot_plugin_qweather"
 
-HELP_TEXT = """和风天气：
-/天气　　　　　　　查当前地址的天气
-/天气 杭州　　　　临时查另一个地点
-/天气 设置 杭州　 把当前地址改成杭州
-/天气 清除　　　　删掉当前地址
-
-地址管理（一个会话可以有多个地址，推送方案各自独立）：
-/地址　　　　　　　列出所有地址
-/地址 加 天津　　　新增地址
-/地址 用 2　　　　 切换当前地址
-/地址 删 2　　　　 删除地址
-/地址 帮助　　　　 全部地址指令
-
-地点可以写城市名或坐标：
-· 城市名最多到区县（省 / 市 / 区县），街道乡镇查不到
-· 坐标写作「经度,纬度」，例如 117.21,39.13（天津），精度约 1 km
-· 坐标会反查出所属区县，名字照常显示，预警按该区县匹配
-
-推送：
-/天气推送　　　　 定时推送规则（作用在当前地址）
-/雨雪提醒　　　　 降水开始 / 结束提醒
-/预警推送　　　　 灾害预警提醒
-　想指定别的地址，在命令里加「地址=2」
-
-配置：
-/key　　　　　　　查看凭据（支持本会话专用 key）
-/额度　　　　　　 余额与请求量"""
-
 ASK_CITY_TEXT = (
     "你还没告诉我地点。平台不会把用户位置给机器人，所以这一步要你自己说：\n"
     "直接回复城市名（例如：天津）或坐标（117.21,39.13），90 秒内有效，我会记住。"
@@ -71,13 +56,88 @@ ASK_CITY_TEXT = (
 
 _SENTENCE_PUNCT = "？?。！!；;，,\n\r"
 _STOPWORDS = ("天气", "怎么样", "如何", "多少", "什么", "吗", "呢", "查", "帮我", "今天", "明天")
-_CMD_PREFIXES = "/~!#！"
+_CMD_PREFIXES = "/～~!！#"
+_WIZARD_CANCEL_WORDS = ("取消", "cancel", "退出", "算了")
+
+# 子指令别名 -> 处理函数名（全部指向本类的方法）
+_SUB_ALIASES = {
+    "天气": "_cmd_weather",
+    "weather": "_cmd_weather",
+    "地址": "_cmd_address",
+    "位置": "_cmd_address",
+    "address": "_cmd_address",
+    "loc": "_cmd_address",
+    "推送": "_cmd_push",
+    "订阅": "_cmd_push",
+    "定时": "_cmd_push",
+    "天气推送": "_cmd_push",
+    "push": "_cmd_push",
+    "雨雪": "_cmd_precip",
+    "降水": "_cmd_precip",
+    "雨雪提醒": "_cmd_precip",
+    "precip": "_cmd_precip",
+    "预警": "_cmd_alert",
+    "警报": "_cmd_alert",
+    "预警推送": "_cmd_alert",
+    "alert": "_cmd_alert",
+    "warning": "_cmd_alert",
+    "key": "_cmd_key",
+    "密钥": "_cmd_key",
+    "凭据": "_cmd_key",
+    "额度": "_cmd_quota",
+    "余额": "_cmd_quota",
+    "用量": "_cmd_quota",
+    "quota": "_cmd_quota",
+    "帮助": "_help_text",
+    "help": "_help_text",
+    "用法": "_help_text",
+    "?": "_help_text",
+    "？": "_help_text",
+}
+
+
+def help_text() -> str:
+    """主帮助。指令写法全部由命名模块生成，前缀改了这里自动跟着变。"""
+    c = naming.cmd
+    p = naming.prefix()
+    return f"""和风天气（指令前缀 /{p}，可在插件配置里改）
+
+天气：
+{c("天气")}　　　　　　　查当前地址的天气
+{c("天气 杭州")}　　　　临时查另一个地点
+{c("天气 设置 杭州")}　 把当前地址改成杭州
+{c("天气 清除")}　　　　删掉当前地址
+
+地址管理（一个会话可以多个地址，推送方案各自独立）：
+{c("地址")}　　　　　　　列出所有地址
+{c("地址 加 天津")}　　　新增地址
+{c("地址 用 2")}　　　　 切换当前地址
+{c("地址 删 2")}　　　　 删除地址
+{c("地址 帮助")}　　　　 全部地址指令
+
+地点可以写城市名或坐标：
+· 城市名最多到区县（省 / 市 / 区县），街道乡镇查不到
+· 坐标写作「经度,纬度」，例如 117.21,39.13（天津），精度约 1 km
+· 坐标会反查出所属区县，名字照常显示，预警按该区县匹配
+
+推送：
+{c("推送")}　　　　　　　定时推送规则（作用在当前地址）
+{c("雨雪")}　　　　　　　降水开始 / 结束提醒
+{c("预警")}　　　　　　　灾害预警提醒
+　想指定别的地址，在命令里加「地址=2」
+
+配置：
+{c("key")}　　　　　　　 查看凭据（支持本会话专用 key）
+{c("额度")}　　　　　　　余额与请求量"""
 
 
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context, config)
         data_dir = self._resolve_data_dir()
+
+        # 前缀必须非空：空前缀等于允许「/天气」这种裸指令，会和别的插件撞名
+        self._prefix = naming.set_prefix(self._cfg_str("command_prefix"))
 
         self._subs = SubStore(data_dir / "subs.json")
         self._keys = KeyStore(
@@ -108,7 +168,7 @@ class QWeatherPlugin(Star):
         key_state = "就绪" if self._keys.default_ready else f"未配置（{self._keys.default_error}）"
         logger.info(
             f"[和风天气] 已启动：{len(locations)} 个地址（{len(sessions)} 个会话），"
-            f"共 {rules} 条推送规则；系统默认 key {key_state}"
+            f"共 {rules} 条推送规则；系统默认 key {key_state}；指令前缀 /{self._prefix}"
         )
         if self._cfg_bool("push_enabled", True):
             self._pusher.start()
@@ -123,119 +183,54 @@ class QWeatherPlugin(Star):
         self._clients.clear()
         self._pending_city.clear()
 
-    # ---------------------------------------------------------------- 指令：天气
-
-    @filter.command("天气")
-    async def cmd_weather(self, event: AstrMessageEvent):
-        """查询天气 / 设置当前地址的地点"""
-        if not self._cfg_bool("enabled", True):
-            yield event.plain_result("和风天气插件已关闭")
-            return
-
-        # /天气推送 会被 AstrBot 当成 /天气 的前缀，先挡掉，交给专门的 handler
-        raw = (event.message_str or "").lstrip("~/!#！ ")
-        if re.match(r"^天气(推送|订阅|提醒)", raw):
-            return
-
-        umo = self._umo(event)
-        self._pending_city.pop(umo, None)
-        self._wizard.cancel(umo)
-
-        args = self._strip_command(event.message_str, "天气")
-        head = args[0].lower() if args else ""
-
-        if head in ("帮助", "help", "?", "？"):
-            yield event.plain_result(HELP_TEXT)
-            return
-
-        if head in ("清除", "解绑", "删除", "clear"):
-            yield event.plain_result(await self._drop_active(umo))
-            return
-
-        if head in ("设置", "set", "绑定"):
-            place_text = join_place(args[1:])
-            if not place_text:
-                yield event.plain_result(
-                    "用法：/天气 设置 杭州\n"
-                    "　　　/天气 设置 117.21,39.13　（经度,纬度，精度约 1 km）"
-                )
-                return
-            yield event.plain_result(await self._set_active_place(umo, place_text))
-            return
-
-        if args:
-            yield event.plain_result(await self._query_place(umo, join_place(args)))
-            return
-
-        loc = await self._subs.active(umo)
-        if loc is not None:
-            yield event.plain_result(await self._commands.render_for_location(umo, loc))
-            return
-
-        self._pending_city[umo] = time.monotonic() + max(15, self._cfg_int("pending_timeout", 90))
-        yield event.plain_result(ASK_CITY_TEXT)
-
-    @filter.command("地址")
-    async def cmd_address(self, event: AstrMessageEvent):
-        """地址管理：增删改切换"""
-        umo = self._umo(event)
-        args = self._strip_command(event.message_str, "地址")
-        yield event.plain_result(await self._commands.handle_address(umo, args))
-
-    @filter.command("天气推送")
-    async def cmd_push(self, event: AstrMessageEvent):
-        """定时推送规则"""
-        umo = self._umo(event)
-        args = self._strip_command(event.message_str, "天气推送")
-        yield event.plain_result(await self._commands.handle_push(umo, args))
-
-    @filter.command("雨雪提醒")
-    async def cmd_precip(self, event: AstrMessageEvent):
-        """降水开始 / 结束提醒"""
-        umo = self._umo(event)
-        args = self._strip_command(event.message_str, "雨雪提醒")
-        try:
-            yield event.plain_result(await self._commands.handle_precip(umo, args))
-        except ValueError as exc:
-            yield event.plain_result(f"❌ {exc}")
-
-    @filter.command("预警推送")
-    async def cmd_alert(self, event: AstrMessageEvent):
-        """灾害预警提醒"""
-        umo = self._umo(event)
-        args = self._strip_command(event.message_str, "预警推送")
-        try:
-            yield event.plain_result(await self._commands.handle_alert(umo, args))
-        except ValueError as exc:
-            yield event.plain_result(f"❌ {exc}")
-
-    @filter.command("key")
-    async def cmd_key(self, event: AstrMessageEvent):
-        """凭据管理（支持本会话专用 key）"""
-        umo = self._umo(event)
-        args = self._strip_command(event.message_str, "key")
-        text, _need_input = await self._commands.handle_key(umo, args)
-        yield event.plain_result(text)
-
-    @filter.command("额度")
-    async def cmd_quota(self, event: AstrMessageEvent):
-        """账户余额与请求量"""
-        umo = self._umo(event)
-        yield event.plain_result(await self._commands.handle_quota(umo))
-
-    # ---------------------------------------------------------------- 补输入
+    # ---------------------------------------------------------------- 消息入口
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def on_pending_input(self, event: AstrMessageEvent):
-        """接管「等用户补输入」的消息：key 设置引导、或反问后的地点名。"""
+    async def on_message(self, event: AstrMessageEvent):
+        """全部消息的唯一入口：先按前缀认指令，认不出来再看是不是在等用户补输入。"""
         if not self._cfg_bool("enabled", True):
             return
 
         umo = self._umo(event)
-        text = (event.message_str or "").strip()
+        text = event.message_str or ""
+
+        matched, sub, args = naming.split(text)
+        if matched:
+            self._pending_city.pop(umo, None)
+            self._wizard.cancel(umo)
+            async for result in self._dispatch(event, umo, sub, args):
+                yield result
+            return
+
+        async for result in self._handle_pending_input(event, umo, text):
+            yield result
+
+    async def _dispatch(self, event: AstrMessageEvent, umo: str, sub: str, args: list[str]):
+        """子指令分发。写错子指令时给出帮助，而不是沉默。"""
+        if not sub:
+            yield event.plain_result(help_text())
+            return
+
+        handler_name = _SUB_ALIASES.get(sub.lower())
+        if handler_name is None:
+            yield event.plain_result(f"不认识的子指令「{sub}」。\n\n" + help_text())
+            return
+
+        try:
+            result = await getattr(self, handler_name)(umo, args)
+        except ValueError as exc:
+            result = f"❌ {exc}"
+        except QWeatherError as exc:
+            result = f"❌ {exc}"
+        if result:
+            yield event.plain_result(result)
+
+    async def _handle_pending_input(self, event: AstrMessageEvent, umo: str, text: str):
+        """接管「等用户补输入」的消息：key 设置引导、或反问后的地点名。"""
+        text = (text or "").strip()
         if not text:
             return
-        if text[0] in _CMD_PREFIXES:  # 用户改主意发指令了，状态作废
+        if text[0] in _CMD_PREFIXES:  # 用户改主意发别的指令了，状态作废
             self._wizard.cancel(umo)
             self._pending_city.pop(umo, None)
             return
@@ -243,7 +238,7 @@ class QWeatherPlugin(Star):
         # 1) key 设置分步引导
         state = self._wizard.get(umo)
         if state is not None:
-            if text in ("取消", "cancel", "退出", "算了"):
+            if text in _WIZARD_CANCEL_WORDS:
                 self._wizard.cancel(umo)
                 event.stop_event()
                 yield event.plain_result("已取消 key 设置。")
@@ -285,9 +280,62 @@ class QWeatherPlugin(Star):
             yield event.plain_result(status or "添加地址失败。")
             return
         yield event.plain_result(
-            f"已记住：{render.loc_label(loc)}。以后直接发「/天气」就行。\n\n"
+            f"已记住：{render.loc_label(loc)}。以后直接发「{naming.cmd('天气')}」就行。\n\n"
             + await self._commands.render_for_location(umo, loc)
         )
+
+    # ---------------------------------------------------------------- 子指令
+
+    async def _help_text(self, umo: str, args: list[str]) -> str:  # noqa: ARG002 统一签名
+        return help_text()
+
+    async def _cmd_weather(self, umo: str, args: list[str]) -> str:
+        """查天气 / 设置当前地址的地点"""
+        head = args[0].lower() if args else ""
+
+        if head in ("帮助", "help", "?", "？"):
+            return help_text()
+
+        if head in ("清除", "解绑", "删除", "clear"):
+            return await self._drop_active(umo)
+
+        if head in ("设置", "set", "绑定"):
+            place_text = join_place(args[1:])
+            if not place_text:
+                return (
+                    f"用法：{naming.cmd('天气 设置 杭州')}\n"
+                    f"　　　{naming.cmd('天气 设置 117.21,39.13')}　（经度,纬度，精度约 1 km）"
+                )
+            return await self._set_active_place(umo, place_text)
+
+        if args:
+            return await self._query_place(umo, join_place(args))
+
+        loc = await self._subs.active(umo)
+        if loc is not None:
+            return await self._commands.render_for_location(umo, loc)
+
+        self._pending_city[umo] = time.monotonic() + max(15, self._cfg_int("pending_timeout", 90))
+        return ASK_CITY_TEXT
+
+    async def _cmd_address(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_address(umo, args)
+
+    async def _cmd_push(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_push(umo, args)
+
+    async def _cmd_precip(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_precip(umo, args)
+
+    async def _cmd_alert(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_alert(umo, args)
+
+    async def _cmd_key(self, umo: str, args: list[str]) -> str:
+        text, _need_input = await self._commands.handle_key(umo, args)
+        return text
+
+    async def _cmd_quota(self, umo: str, args: list[str]) -> str:  # noqa: ARG002
+        return await self._commands.handle_quota(umo)
 
     # ---------------------------------------------------------------- 天气实现
 
@@ -366,12 +414,11 @@ class QWeatherPlugin(Star):
 
         updated = await self._subs.update_location(umo, current["lid"], {"city": place})
         if updated is None:
-            return "❌ 地址已被删除，重发「/地址」看看。"
+            return f"❌ 地址已被删除，重发「{naming.cmd('地址')}」看看。"
         hint = ""
         if place.get("coord"):
-            hint = (
-                f"\n坐标精度约 1 km（0.01°）。想回到行政区中心就发「/天气 设置 {place['name']}」。"
-            )
+            named = naming.cmd(f"天气 设置 {place['name']}")
+            hint = f"\n坐标精度约 1 km（0.01°）。想回到行政区中心就发「{named}」。"
         return f"已更新当前位置：{render.loc_label(updated)}{hint}\n\n" + (
             await self._commands.render_for_location(umo, updated)
         )
@@ -386,14 +433,14 @@ class QWeatherPlugin(Star):
         if current and render.loc_label(current) != render.loc_label(temp):
             text_out += (
                 f"\n\n（临时查询。当前地址还是 {render.loc_label(current)}，"
-                "要改发「/天气 设置 ...」）"
+                f"要改发「{naming.cmd('天气 设置 ...')}」）"
             )
         return text_out
 
     async def _drop_active(self, umo: str) -> str:
         current = await self._subs.active(umo)
         if current is None:
-            return "你还没有地址，直接发「/天气 城市名」即可"
+            return f"你还没有地址，直接发「{naming.cmd('天气 城市名')}」即可"
         locations = await self._subs.locations(umo)
         if len(locations) > 1:
             removed = await self._subs.delete_location(umo, current["lid"])
@@ -407,7 +454,8 @@ class QWeatherPlugin(Star):
         removed = await self._subs.delete_location(umo, current["lid"])
         return (
             f"已删除地址：{render.loc_label(removed or current)}\n"
-            "顺便说一句：只剩一个地址时删掉就等于重置，下次发「/天气」会重新问你地点。"
+            f"顺便说一句：只剩一个地址时删掉就等于重置，下次发「{naming.cmd('天气')}」"
+            "会重新问你地点。"
             if removed
             else "删除失败。"
         )
@@ -526,15 +574,6 @@ class QWeatherPlugin(Star):
         if any(ch in text for ch in _SENTENCE_PUNCT):
             return False
         return not any(word in text for word in _STOPWORDS)
-
-    @staticmethod
-    def _strip_command(message_str: str, command: str) -> list[str]:
-        text = (message_str or "").replace("\u3000", " ").strip()
-        text = re.sub(r"^(?:@\S+\s+)+", "", text)
-        text = re.sub(
-            rf"^[~/!#！]{{0,2}}\s*{re.escape(command)}(?=\s|$)\s*", "", text, flags=re.IGNORECASE
-        )
-        return text.split() if text else []
 
     def _resolve_data_dir(self) -> Path:
         try:

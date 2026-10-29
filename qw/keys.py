@@ -2,7 +2,7 @@
 
 优先级
 ------
-1. 本会话自己设置的 key（``/key 设置`` 走分步引导，存在 ``keys.json``）；
+1. 本会话自己设置的 key（``/qweather key 设置`` 走分步引导，存在 ``keys.json``）；
 2. 系统默认 key（插件配置里的 iss/sub/kid/host + 私钥）；
 3. 都没有 → 提示用户去配。
 
@@ -22,6 +22,7 @@ from typing import Any
 
 from .client import KeyConfig
 from .jwtlite import public_key_b64, seed_from_pem
+from .naming import cmd
 
 MAX_SESSIONS = 2000
 
@@ -211,7 +212,7 @@ class KeyStore:
         return None
 
     async def describe(self, umo: str) -> str:
-        """给 ``/key`` 查看用的一段人话。"""
+        """给 ``/qweather key`` 查看用的一段人话。"""
         record = await self.get_session(umo)
         lines: list[str] = []
         if record:
@@ -229,7 +230,9 @@ class KeyStore:
         if self.default_ready:
             lines.append(f"系统公钥：{self.default_public_key()}")
         else:
-            lines.append(f"⚠️ {self.default_error}，请在插件配置里填好，或本会话用「/key 设置」自带")
+            lines.append(
+                f"⚠️ {self.default_error}，请在插件配置里填好，或本会话用「{cmd('key 设置')}」自带"
+            )
         return "\n".join(lines)
 
 

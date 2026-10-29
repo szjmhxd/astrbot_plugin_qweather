@@ -372,7 +372,7 @@ def window_text(windows: list[dict[str, str]]) -> str:
 
 
 def describe_rule(rule: dict[str, Any], idx: int | None = None) -> str:
-    """一行中文摘要，给 ``/天气推送`` 列表用。"""
+    """一行中文摘要，给 ``/qweather 推送`` 列表用。"""
     kind = rule.get("kind") or "clock"
     head = f"{idx}. " if idx is not None else ""
     flag = "" if rule.get("enabled", True) else "【已关闭】"

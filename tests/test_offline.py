@@ -727,7 +727,7 @@ def test_address_cmds() -> None:
         check("切到不存在的地址报错", "没找到地址" in out, out[:60])
 
         out = await cmd.handle_address(umo, ["帮助"])
-        check("地址帮助可读", "/地址 加" in out)
+        check("地址帮助可读", "/qweather 地址 加" in out, out[:80])
 
     asyncio.run(run())
 
@@ -1002,34 +1002,63 @@ def test_render() -> None:
 # ---------------------------------------------------------------- 8. 插件类
 
 
+def test_naming() -> None:
+    section("指令前缀：拆分、回落、文案联动")
+    from astrbot_plugin_qweather.qw import commands as cmds
+    from astrbot_plugin_qweather.qw import naming
+
+    naming.set_prefix("qweather")
+    check("默认前缀", naming.prefix() == "qweather")
+
+    ok, sub, args = naming.split("/qweather 天气 杭州")
+    check("带唤醒符能认", ok and sub == "天气" and args == ["杭州"], f"{ok}/{sub}/{args}")
+    ok, sub, args = naming.split("qweather 天气")
+    check("唤醒符已被框架吃掉也能认", ok and sub == "天气" and args == [], f"{ok}/{sub}")
+    ok, sub, args = naming.split("qweather天气 杭州")
+    check("漏空格也能认", ok and sub == "天气" and args == ["杭州"], f"{ok}/{sub}/{args}")
+    ok, sub, args = naming.split("/qweather　地址　用　2")
+    check("全角空格也能切", ok and sub == "地址" and args == ["用", "2"], f"{ok}/{sub}/{args}")
+    ok, sub, args = naming.split("@bot /qweather 推送 加 每天 07:30")
+    check(
+        "@机器人 前缀被去掉",
+        ok and sub == "推送" and args == ["加", "每天", "07:30"],
+        f"{ok}/{sub}/{args}",
+    )
+    check("只发主指令", naming.split("/qweather") == (True, "", []))
+    check("裸指令不再接管", naming.split("/天气 杭州")[0] is False)
+    check("英文前缀只认整词", naming.split("/qweatherly 天气")[0] is False)
+
+    for raw in ("", "   ", "/", "　", None):
+        check(f"空前缀回落成默认值：{raw!r}", naming.normalize(raw) == "qweather")
+    check("前缀自带斜杠会被洗掉", naming.normalize("/qw") == "qw")
+
+    naming.set_prefix("和风")
+    check("自定义前缀生效", naming.cmd("天气") == "/和风 天气")
+    check("自定义前缀能认", naming.split("/和风 天气")[0])
+    check("自定义前缀漏空格也能认", naming.split("/和风天气")[1] == "天气")
+    check("地址帮助跟着前缀变", "/和风 地址" in cmds.address_help())
+    check("推送帮助跟着前缀变", "/和风 推送" in cmds.push_help())
+    naming.set_prefix("qweather")
+    check("恢复默认后文案跟着回", "/qweather 地址" in cmds.address_help())
+
+    from astrbot_plugin_qweather.main import help_text
+
+    check("主帮助用的是前缀指令", "/qweather 天气" in help_text())
+    check("主帮助里没有裸指令", "/天气" not in help_text())
+
+
 def test_plugin_class() -> None:
     section("插件类：指令字符串处理")
     from astrbot_plugin_qweather.main import QWeatherPlugin
+    from astrbot_plugin_qweather.qw import naming
 
-    check("/天气 杭州 → ['杭州']", QWeatherPlugin._strip_command("/天气 杭州", "天气") == ["杭州"])
-    check(
-        "/天气推送 加 每天 07:30 → 4 段",
-        QWeatherPlugin._strip_command("/天气推送 加 每天 07:30", "天气推送")
-        == ["加", "每天", "07:30"],
-    )
-    check(
-        "全角空格也能切",
-        QWeatherPlugin._strip_command("/天气　设置　天津", "天气") == ["设置", "天津"],
-    )
-    check(
-        "@机器人 前缀被去掉", QWeatherPlugin._strip_command("@bot /天气 杭州", "天气") == ["杭州"]
-    )
+    naming.set_prefix("qweather")
     check("地点粗筛：天津", QWeatherPlugin._looks_like_place("天津"))
     check("地点粗筛：挡掉问句", not QWeatherPlugin._looks_like_place("天气怎么样？"))
     check("地点粗筛：挡掉指令", not QWeatherPlugin._looks_like_place("/天气"))
     check("地点粗筛：挡掉长句", not QWeatherPlugin._looks_like_place("今天天津的天气情况怎么样呢"))
     check("地点粗筛：放行坐标", QWeatherPlugin._looks_like_place("117.21,39.13"))
     check("地点粗筛：坐标写反也放行（才能报错）", QWeatherPlugin._looks_like_place("39.13,117.21"))
-    check(
-        "设置坐标时参数不被空格切坏",
-        QWeatherPlugin._strip_command("/天气 设置 117.21 39.13", "天气")
-        == ["设置", "117.21", "39.13"],
-    )
 
     section("地点参数拼合")
     check("单个城市名", join_place(["天津"]) == "天津")
@@ -1064,13 +1093,34 @@ def test_plugin_class() -> None:
                 private_key="",
                 enabled=True,
                 push_enabled=False,
+                command_prefix="qw",
             ),
         )
         check("插件可实例化", plugin._subs is not None and plugin._commands is not None)
         check("地点解析已注入指令层", plugin._commands._resolve is not None)
         check("地址指令已就绪", hasattr(plugin._commands, "handle_address"))
+        check("配置里的前缀生效", plugin._prefix == "qw" and naming.prefix() == "qw")
+
+        section("消息入口：前缀路由")
+
+        async def run_message(text: str) -> list[str]:
+            await plugin._subs.load()
+            event = _FakeEvent(text)
+            return [item async for item in plugin.on_message(event)]
+
+        check("配了前缀就只认它", "地址" in "".join(asyncio.run(run_message("/qw 帮助"))))
+        check("默认前缀此时不响应", asyncio.run(run_message("/qweather 帮助")) == [])
+        check("裸指令彻底不接管", asyncio.run(run_message("/天气 杭州")) == [])
+        out = "".join(asyncio.run(run_message("/qw 瞎写")))
+        check("写错子指令给出帮助而不是沉默", "不认识的子指令" in out and "地址" in out, out[:80])
+        out = "".join(asyncio.run(run_message("/qw 地址")))
+        check("子指令能落到具体实现", "地址" in out, out[:80])
+        out = "".join(asyncio.run(run_message("/qw 额度")))
+        check("额度查询不崩（无网络时给错误提示）", bool(out), out[:80])
     except Exception as exc:  # noqa: BLE001 构造失败就是部署会炸，必须暴露
         check("插件可实例化", False, f"{type(exc).__name__}: {exc}")
+    finally:
+        naming.set_prefix("qweather")
 
     session = QWeatherPlugin._build_session("kook:GroupMessage:123", _FakeSession)
     check(
@@ -1087,6 +1137,21 @@ class _FakeSession:
         self.session_id = session_id
 
 
+class _FakeEvent:
+    """够用就行的假事件：只实现插件真正读的字段。"""
+
+    def __init__(self, text: str, umo: str = "test:GroupMessage:1") -> None:
+        self.message_str = text
+        self.unified_msg_origin = umo
+        self.stopped = False
+
+    def plain_result(self, text: str):
+        return text
+
+    def stop_event(self) -> None:
+        self.stopped = True
+
+
 # ---------------------------------------------------------------- 主流程
 
 
@@ -1101,6 +1166,7 @@ def main() -> int:
     test_pusher()
     test_keys()
     test_render()
+    test_naming()
     test_plugin_class()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0

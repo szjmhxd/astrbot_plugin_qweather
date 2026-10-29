@@ -5,9 +5,12 @@
 
 指令族
 ------
-``/地址``　　　管理多个地址（增删改切换），每个地址有独立的推送方案
-``/天气推送``  ``/雨雪提醒``  ``/预警推送``  ``/key``  ``/额度``
-另有 ``/天气`` 负责查天气和设置当前地址的地点（在 main.py 里，因为要复用 pending 输入机制）。
+``/qweather 地址``　　管理多个地址（增删改切换），每个地址有独立的推送方案
+``/qweather 推送``  ``/qweather 雨雪``  ``/qweather 预警``  ``/qweather key``  ``/qweather 额度``
+另有 ``/qweather 天气`` 负责查天气和设置当前地址的地点（在 main.py 里，
+因为要复用 pending 输入机制）。
+
+指令写法一律用 :func:`qw.naming.cmd` 生成，前缀改配置就整体跟着变，不在文案里写死。
 
 地址的作用域规则
 ----------------
@@ -25,40 +28,46 @@ from typing import Any
 from . import render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore, KeyWizard
+from .naming import cmd
 from .store import MAX_LOCATIONS, SubStore, normalize_level
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
 # (umo, 用户输入) -> (地点 dict 或 None, 错误提示)
 PlaceResolver = Callable[[str, str], Awaitable[tuple[dict[str, Any] | None, str]]]
 
-PUSH_HELP = """推送指令（作用在当前地址上，加 地址=2 可指定别的地址）：
-/天气推送　　　　　　　　　　列出规则
-/天气推送 加 每天 07:30 内容=now,daily,sun
-/天气推送 加 每周 一,三,五 07:30 内容=daily,air
-/天气推送 加 每月 1,15 09:00 内容=daily
-/天气推送 加 每小时 8-20 0,30 内容=now,air
-/天气推送 加 日出 -30 内容=now,daily,sun
-/天气推送 改 1 时间=08:00 内容=now,daily
-/天气推送 开 1　　关 1　　删 1　　试 1
+
+def push_help() -> str:
+    return f"""推送指令（作用在当前地址上，加 地址=2 可指定别的地址）：
+{cmd("推送")}　　　　　　　　　　列出规则
+{cmd("推送 加 每天 07:30 内容=now,daily,sun")}
+{cmd("推送 加 每周 一,三,五 07:30 内容=daily,air")}
+{cmd("推送 加 每月 1,15 09:00 内容=daily")}
+{cmd("推送 加 每小时 8-20 0,30 内容=now,air")}
+{cmd("推送 加 日出 -30 内容=now,daily,sun")}
+{cmd("推送 改 1 时间=08:00 内容=now,daily")}
+{cmd("推送 开 1")}　　关 1　　删 1　　试 1
 
 内容可选：now 实况 / daily 预报 / hourly 逐时 / air 空气
 　　　　　indices 指数 / alert 预警 / sun 日出日落 / minutely 降水
 
-地址：/地址 查看与切换，「/地址 加 天津」新增一个地址。
+地址：{cmd("地址")} 查看与切换，「{cmd("地址 加 天津")}」新增一个地址。
 """
 
-ADDRESS_HELP = """地址指令：一个会话可以有多个地址，每个地址的推送方案各自独立。
-/地址　　　　　　　　　 列出所有地址
-/地址 加 天津　　　　　 添加地址（城市名，最多到区县）
-/地址 加 117.21,39.13　 添加地址（坐标，精度约 1 km）
-/地址 加 天津 名称=公司　带别名，方便区分
-/地址 用 2　　　　　　　切换当前地址（也可以写别名）
-/地址 改 2 名称=家　　　 改别名
-/地址 改 2 地点=武清　　 改绑地点
-/地址 删 2　　　　　　　删除地址及其全部推送方案
-/地址 查 2　　　　　　　查该地址的天气，不切换
+
+def address_help() -> str:
+    return f"""地址指令：一个会话可以有多个地址，每个地址的推送方案各自独立。
+{cmd("地址")}　　　　　　　　　 列出所有地址
+{cmd("地址 加 天津")}　　　　　 添加地址（城市名，最多到区县）
+{cmd("地址 加 117.21,39.13")}　 添加地址（坐标，精度约 1 km）
+{cmd("地址 加 天津 名称=公司")}　带别名，方便区分
+{cmd("地址 用 2")}　　　　　　　切换当前地址（也可以写别名）
+{cmd("地址 改 2 名称=家")}　　　 改别名
+{cmd("地址 改 2 地点=武清")}　　 改绑地点
+{cmd("地址 删 2")}　　　　　　　删除地址及其全部推送方案
+{cmd("地址 查 2")}　　　　　　　查该地址的天气，不切换
 
 推送指令默认作用在当前地址，加「地址=2」可临时指定。"""
+
 
 LEVEL_LABEL = {"blue": "蓝色", "yellow": "黄色", "orange": "橙色", "red": "红色"}
 
@@ -204,16 +213,16 @@ class Commands:
         if ref:
             loc = await self._store.location(umo, ref)
             if loc is None:
-                return None, f"没找到地址「{ref}」，发「/地址」看列表。"
+                return None, f"没找到地址「{ref}」，发「{cmd('地址')}」看列表。"
             return loc, ""
         loc = await self._store.active(umo)
         if loc is None:
-            return None, "⚠️ 还没有地址。先发「/地址 加 天津」建一个。"
+            return None, f"⚠️ 还没有地址。先发「{cmd('地址 加 天津')}」建一个。"
         return loc, ""
 
     async def handle_address(self, umo: str, args: list[str]) -> str:
         if args and args[0] in ("帮助", "help", "?", "？"):
-            return ADDRESS_HELP
+            return address_help()
 
         head = args[0] if args else ""
         rest = args[1:]
@@ -226,15 +235,15 @@ class Commands:
 
         if head in ("用", "切换", "选", "use", "switch"):
             if not rest:
-                return "用法：/地址 用 2（也可以写别名）"
+                return f"用法：{cmd('地址 用 2')}（也可以写别名）"
             loc = await self._store.set_active(umo, rest[0])
             if loc is None:
-                return f"没找到地址「{rest[0]}」。发「/地址」看列表。"
+                return f"没找到地址「{rest[0]}」。发「{cmd('地址')}」看列表。"
             return f"✅ 当前地址已切到：{render.loc_label(loc)}"
 
         if head in ("删", "删除", "del"):
             if not rest:
-                return "用法：/地址 删 2"
+                return f"用法：{cmd('地址 删 2')}"
             if len(await self._store.locations(umo)) <= 1:
                 loc = await self._store.active(umo)
                 if loc is not None:
@@ -250,7 +259,7 @@ class Commands:
 
         if head in ("改", "修改", "edit", "rename"):
             if not rest:
-                return "用法：/地址 改 2 名称=家　　或　/地址 改 2 地点=武清"
+                return f"用法：{cmd('地址 改 2 名称=家')}　　或　{cmd('地址 改 2 地点=武清')}"
             ref = rest[0]
             _, kv = _kv_split(rest[1:])
             patch: dict[str, Any] = {}
@@ -283,7 +292,7 @@ class Commands:
     async def _address_list(self, umo: str) -> str:
         locations = await self._store.locations(umo)
         if not locations:
-            return "还没有地址。\n\n" + ADDRESS_HELP
+            return "还没有地址。\n\n" + address_help()
         active = await self._store.active(umo)
         active_lid = (active or {}).get("lid")
         lines = ["地址列表（每个地址的推送方案各自独立）："]
@@ -300,7 +309,7 @@ class Commands:
             tail = f"（{'，'.join(tags)}）" if tags else ""
             lines.append(f"{mark} {idx}. {render.loc_label(loc)}{tail}")
         lines.append("")
-        lines.append("▶ 是当前地址。「/地址 用 2」切换，「/地址 加 ...」新增。")
+        lines.append(f"▶ 是当前地址。「{cmd('地址 用 2')}」切换，「{cmd('地址 加 ...')}」新增。")
         return "\n".join(lines)
 
     async def _add_address(self, umo: str, rest: list[str]) -> str:
@@ -309,7 +318,10 @@ class Commands:
         positional, kv = _kv_split(rest)
         place_text = join_place(positional)
         if not place_text:
-            return "用法：/地址 加 天津　或　/地址 加 117.21,39.13　或　/地址 加 天津 名称=公司"
+            return (
+                f"用法：{cmd('地址 加 天津')}　或　{cmd('地址 加 117.21,39.13')}"
+                f"　或　{cmd('地址 加 天津 名称=公司')}"
+            )
         if len(await self._store.locations(umo)) >= MAX_LOCATIONS:
             return f"最多 {MAX_LOCATIONS} 个地址，先删掉不用的。"
         place, err = await self._resolve(umo, place_text)
@@ -325,8 +337,8 @@ class Commands:
             hint = "\n坐标精度约 1 km（0.01°）。"
         return (
             f"✅ 已添加地址：{render.loc_label(loc)}{hint}\n"
-            f"已设为当前地址，接下来「/天气推送」「/雨雪提醒」「/预警推送」都作用在它上面。\n\n"
-            + await self.render_for_location(umo, loc, preview=False)
+            f"已设为当前地址，接下来「{cmd('推送')}」「{cmd('雨雪')}」「{cmd('预警')}」"
+            "都作用在它上面。\n\n" + await self.render_for_location(umo, loc, preview=False)
         )
 
     # ================================================================ 推送规则
@@ -334,7 +346,7 @@ class Commands:
     async def handle_push(self, umo: str, args: list[str]) -> str:
         args, addr_ref = _pop_address(args)
         if not args or args[0] in ("帮助", "help", "?", "？"):
-            return PUSH_HELP
+            return push_help()
 
         head = args[0]
         rest = args[1:]
@@ -363,13 +375,13 @@ class Commands:
         if head in ("试", "测试", "test"):
             return await self._try_rule(umo, loc, rest)
 
-        return PUSH_HELP
+        return push_help()
 
     async def _list_rules(self, umo: str, loc: dict[str, Any]) -> str:
         rules = loc.get("rules") or []
         lines = [f"地址：{render.loc_label(loc)}", ""]
         if not rules:
-            lines.append("还没有推送规则。用「/天气推送 加 每天 07:30 内容=now,daily」添加。")
+            lines.append(f"还没有推送规则。用「{cmd('推送 加 每天 07:30 内容=now,daily')}」添加。")
             return "\n".join(lines)
         for idx, rule in enumerate(rules, 1):
             lines.append(schedule.describe_rule(rule, idx))
@@ -381,11 +393,11 @@ class Commands:
         try:
             rule = parse_rule(rest)
         except ValueError as exc:
-            return f"❌ {exc}\n\n{PUSH_HELP}"
+            return f"❌ {exc}\n\n{push_help()}"
 
         saved = await self._store.add_rule(umo, loc["lid"], rule)
         if saved is None:
-            return "❌ 地址已被删除，重发「/地址」看看。"
+            return f"❌ 地址已被删除，重发「{cmd('地址')}」看看。"
         rules = await self._store.list_rules(umo, loc["lid"])
         idx = next((i for i, r in enumerate(rules, 1) if r.get("id") == saved.get("id")), 0)
         lines = [
@@ -399,10 +411,10 @@ class Commands:
 
     async def _edit_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
-            return "用法：/天气推送 改 1 时间=08:00 内容=now,daily"
+            return f"用法：{cmd('推送 改 1 时间=08:00 内容=now,daily')}"
         rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
-            return f"没找到规则 {rest[0]}，发「/天气推送」看列表。"
+            return f"没找到规则 {rest[0]}，发「{cmd('推送')}」看列表。"
         _, kv = _kv_split(rest[1:])
         patch: dict[str, Any] = {}
         try:
@@ -424,7 +436,7 @@ class Commands:
         self, umo: str, loc: dict[str, Any], rest: list[str], enabled: bool
     ) -> str:
         if not rest:
-            return "用法：/天气推送 开 1"
+            return f"用法：{cmd('推送 开 1')}"
         rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
@@ -435,7 +447,7 @@ class Commands:
 
     async def _delete_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
-            return "用法：/天气推送 删 1"
+            return f"用法：{cmd('推送 删 1')}"
         rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
@@ -444,7 +456,7 @@ class Commands:
 
     async def _try_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
-            return "用法：/天气推送 试 1（立即按该规则渲染一次，不发到频道）"
+            return f"用法：{cmd('推送 试 1')}（立即按该规则渲染一次，不发到频道）"
         rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
@@ -584,7 +596,7 @@ class Commands:
 
         if head in ("加时段", "加"):
             if not rest:
-                return "用法：/雨雪提醒 加时段 08:00-12:00"
+                return f"用法：{cmd('雨雪 加时段 08:00-12:00')}"
             window = self._parse_window(rest[0])
             windows = list(cfg.get("windows") or []) + [window]
             await self._store.patch_section(umo, lid, "precip", {"windows": windows})
@@ -597,7 +609,7 @@ class Commands:
 
         if head in ("删时段", "删"):
             if not rest or not rest[0].isdigit():
-                return "用法：/雨雪提醒 删时段 2"
+                return f"用法：{cmd('雨雪 删时段 2')}"
             idx = int(rest[0]) - 1
             windows = list(cfg.get("windows") or [])
             if not (0 <= idx < len(windows)):
@@ -610,14 +622,14 @@ class Commands:
 
         if head in ("间隔", "轮询"):
             if not rest or not rest[0].isdigit():
-                return "用法：/雨雪提醒 间隔 10（分钟，范围 5-60）"
+                return f"用法：{cmd('雨雪 间隔 10')}（分钟，范围 5-60）"
             value = max(5, min(int(rest[0]), 60))
             await self._store.patch_section(umo, lid, "precip", {"poll_interval": value})
             return f"✅ 轮询间隔改为 {value} 分钟"
 
         if head in ("提前",):
             if not rest or not rest[0].isdigit():
-                return "用法：/雨雪提醒 提前 60（分钟）"
+                return f"用法：{cmd('雨雪 提前 60')}（分钟）"
             value = max(10, min(int(rest[0]), 120))
             await self._store.patch_section(umo, lid, "precip", {"lead_minutes": value})
             return f"✅ 提前量改为 {value} 分钟"
@@ -625,7 +637,7 @@ class Commands:
         for key, labels in (("on_start", ("开始",)), ("on_stop", ("结束",))):
             if head in labels:
                 if not rest or rest[0] not in ("开", "关", "on", "off"):
-                    return f"用法：/雨雪提醒 {head} 开|关"
+                    return f"用法：{cmd('雨雪 ' + head + ' 开|关')}"
                 enabled = rest[0] in ("开", "on")
                 await self._store.patch_section(umo, lid, "precip", {key: enabled})
                 label = "降水开始提醒" if key == "on_start" else "降水结束提醒"
@@ -643,7 +655,7 @@ class Commands:
                 f"　降水结束：{'开' if cfg.get('on_stop') else '关'}",
                 f"提前量：{cfg.get('lead_minutes')} 分钟　轮询：{cfg.get('poll_interval')} 分钟",
                 "",
-                "加时段 08:00-12:00｜删时段 2｜间隔 10｜提前 60｜开始 开｜结束 关",
+                "本指令后接：加时段 08:00-12:00｜删时段 2｜间隔 10｜提前 60｜开始 开｜结束 关",
             ]
         )
 
@@ -695,14 +707,14 @@ class Commands:
 
         if head in ("间隔", "轮询"):
             if not rest or not rest[0].isdigit():
-                return "用法：/预警推送 间隔 60（分钟，范围 5-360）"
+                return f"用法：{cmd('预警 间隔 60')}（分钟，范围 5-360）"
             value = max(5, min(int(rest[0]), 360))
             await self._store.patch_section(umo, lid, "alert", {"poll_interval": value})
             return f"✅ 轮询间隔改为 {value} 分钟"
 
         if head in ("等级", "级别"):
             if not rest:
-                return "用法：/预警推送 等级 橙（蓝/黄/橙/红）"
+                return f"用法：{cmd('预警 等级 橙')}（蓝/黄/橙/红）"
             level = normalize_level(rest[0])
             if not level:
                 return f"不认识的等级：{rest[0]}（用 蓝/黄/橙/红）"
@@ -711,14 +723,14 @@ class Commands:
 
         if head in ("升级",):
             if not rest or rest[0] not in ("开", "关", "on", "off"):
-                return "用法：/预警推送 升级 开|关"
+                return f"用法：{cmd('预警 升级 开|关')}"
             enabled = rest[0] in ("开", "on")
             await self._store.patch_section(umo, lid, "alert", {"notify_on_upgrade": enabled})
             return f"✅ 等级升高再推送：{'开启' if enabled else '关闭'}"
 
         if head in ("加时段", "加"):
             if not rest:
-                return "用法：/预警推送 加时段 07:00-23:00"
+                return f"用法：{cmd('预警 加时段 07:00-23:00')}"
             window = self._parse_window(rest[0])
             windows = list(cfg.get("windows") or []) + [window]
             await self._store.patch_section(umo, lid, "alert", {"windows": windows})
@@ -726,7 +738,7 @@ class Commands:
 
         if head in ("删时段", "删"):
             if not rest or not rest[0].isdigit():
-                return "用法：/预警推送 删时段 1"
+                return f"用法：{cmd('预警 删时段 1')}"
             idx = int(rest[0]) - 1
             windows = list(cfg.get("windows") or [])
             if not (0 <= idx < len(windows)):
@@ -770,7 +782,7 @@ class Commands:
                 f"可提醒时段：{schedule.window_text(cfg.get('windows') or [])}",
                 f"等级升高再推：{'开' if cfg.get('notify_on_upgrade') else '关'}",
                 "",
-                "间隔 60｜等级 橙｜升级 开｜加时段 07:00-23:00｜删时段 1｜测试",
+                "本指令后接：间隔 60｜等级 橙｜升级 开｜加时段 07:00-23:00｜删时段 1｜测试",
             ]
         )
 
@@ -838,8 +850,11 @@ class Commands:
                     "\n提示：host 用控制台-设置里那个专属 API Host"
                     "（形如 xxxx.re.qweatherapi.com）。"
                 )
-            return f"⚠️ 已保存，但校验未通过：{exc}{hint}\n发「/key 设置」可重配。"
-        return "✅ 本会话专用 key 已保存并校验通过。发「/key」查看，发「/key 默认」可恢复系统 key。"
+            return f"⚠️ 已保存，但校验未通过：{exc}{hint}\n发「{cmd('key 设置')}」可重配。"
+        return (
+            f"✅ 本会话专用 key 已保存并校验通过。发「{cmd('key')}」查看，"
+            f"发「{cmd('key 默认')}」可恢复系统 key。"
+        )
 
     # ================================================================ 额度
 
