@@ -49,6 +49,10 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# 测试临时数据
+_test_data/
+tests/_test_data/
+
 # AstrBot 运行时数据（按规范落在 AstrBot 的 data 目录，不应进仓库）
 data/
 plugin_data/

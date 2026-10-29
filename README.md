@@ -187,6 +187,7 @@ iss/sub/kid 配自己的私钥只会得到 401。
 | `qw/render.py` | 纯文本渲染 |
 | `qw/commands.py` | 指令执行（不依赖 AstrBot） |
 | `qw/pushers.py` | 后台主循环与三个推送源 |
+| `tests/test_offline.py` | 离线冒烟测试（桩模块替换 AstrBot，不联网） |
 
 数据落在 `data/plugin_data/astrbot_plugin_qweather/`：`subs.json`（订阅与去重状态）、
 `keys.json`（会话级 key）。**去重状态必须落盘**，否则重启会把当前所有预警重推一遍。
@@ -194,12 +195,18 @@ iss/sub/kid 配自己的私钥只会得到 401。
 ## 开发
 
 ```bash
-# 离线单测（不需要 AstrBot，不需要网络）
-python _smoke_qweather.py
-
-# 真实接口验证（会消耗接口调用）
-python _live_qweather.py
+# 离线冒烟测试：不需要 AstrBot、不需要网络、不消耗接口调用
+python tests/test_offline.py
 ```
+
+覆盖签名、规则引擎、存储、指令解析、渲染五块纯逻辑。涉及真实接口的部分
+无法离线验证，装进 AstrBot 后实际跑一遍指令即可。
 
 `main.py` 里的 `@filter.*` 必须留在 `main.py`——AstrBot 用 `handler_module_path` 精确匹配
 handler 归属，写在其它模块会被静默丢弃。
+
+代码风格用 ruff（配置见 `pyproject.toml`）：
+
+```bash
+ruff check . && ruff format .
+```
