@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+wheels/
+sdist/
+.Python
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+htmlcov/
+coverage.xml
+
+# Environments
+.env
+.envrc
+.venv
+venv/
+env/
+ENV/
+
+# Ruff / mypy / type checkers
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+.pyre/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AstrBot 运行时数据（按规范落在 AstrBot 的 data 目录，不应进仓库）
+data/
+plugin_data/
+subs.json
+keys.json
+*.pem
+!README.md

@@ -1,0 +1,62 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用和风天气",
+    "hint": "总开关。关闭后不响应任何指令，也不会推送。",
+    "default": true
+  },
+  "push_enabled": {
+    "type": "bool",
+    "description": "启用后台推送",
+    "hint": "关掉后只保留查询功能，定时推送、雨雪提醒、预警推送全部停止。调试配置时可以先关掉。",
+    "default": true
+  },
+  "iss": {
+    "type": "string",
+    "description": "系统默认 key - 开发者 ID（iss）",
+    "hint": "控制台 → 设置，Q 开头 10 位，例如 Q1A2B3C4D5。留空则必须由每个会话自己用「/key 设置」。",
+    "default": ""
+  },
+  "sub": {
+    "type": "string",
+    "description": "系统默认 key - 项目 ID（sub）",
+    "hint": "控制台 → 项目管理，点进项目后可见。",
+    "default": ""
+  },
+  "kid": {
+    "type": "string",
+    "description": "系统默认 key - 凭据 ID（kid）",
+    "hint": "创建凭据并上传公钥后显示的凭据 ID。",
+    "default": ""
+  },
+  "host": {
+    "type": "string",
+    "description": "系统默认 key - API Host",
+    "hint": "控制台 → 设置里的专属 Host，形如 ne6yvtne25.re.qweatherapi.com。不要带 https://。（实测 api.qweather.com 目前也能用，但官方口径是用专属 Host，别依赖公共域名。）",
+    "default": ""
+  },
+  "private_key": {
+    "type": "text",
+    "description": "系统默认 key - 私钥 PEM",
+    "hint": "Ed25519 私钥，三行 PEM 全文粘贴。它与控制台上传的公钥必须成对。泄露等于泄露账号，不要外传。",
+    "default": ""
+  },
+  "http_timeout": {
+    "type": "int",
+    "description": "接口超时（秒）",
+    "hint": "访问和风 API 的超时时间。网络差时调到 20。",
+    "default": 12
+  },
+  "pending_timeout": {
+    "type": "int",
+    "description": "等待用户报城市的超时（秒）",
+    "hint": "用户发「/天气」但没绑定城市时会反问，这段时间内收到的下一条短文本会被当作城市名。默认 90 秒，最小 15 秒。",
+    "default": 90
+  },
+  "include_air": {
+    "type": "bool",
+    "description": "查询天气时附带空气质量",
+    "hint": "每次 /天气 多花一次接口调用。推送里的空气质量由各条规则自己的「内容」控制，不受这里影响。",
+    "default": true
+  }
+}

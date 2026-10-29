@@ -1,0 +1,8 @@
+name: astrbot_plugin_qweather
+display_name: 和风天气订阅推送
+desc: 基于和风天气 QWeather 的天气查询与主动推送。支持定时推送天气（每天 / 每周 / 每月 / 每小时 / 日出日落前后）、降水开始与结束提醒、灾害预警轮询推送，全部配置在对话里完成，并支持每个会话使用自己的 API 凭据。
+short_desc: 天气查询 + 定时推送 + 降水与灾害预警提醒
+version: v1.0.0
+author: szjmhxd
+repo: https://github.com/szjmhxd/astrbot_plugin_qweather
+astrbot_version: ">=4.16,<5"
