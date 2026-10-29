@@ -50,11 +50,54 @@ def _wind(compass: str, scale: Any) -> str:
     return f"{direction}{scale}级" if direction else f"{scale}级"
 
 
+def place_label(place: dict[str, Any]) -> str:
+    """省·市·区县 拼成可读地名。
+
+    GeoAPI 最多给到区县一级（``adm1`` 省 / ``adm2`` 市 / ``name`` 区县），三层经常重复
+    （天津市 / 天津 / 和平），相邻层互相包含时只留更详细的那个。
+    用户直接给坐标时，``coord`` 为真，末尾追加坐标，免得被误认为定位到了区县中心。
+    """
+    name = place.get("name") or "未知位置"
+    parts: list[str] = []
+    for raw in (place.get("adm1") or "", place.get("adm2") or "", name):
+        part = (raw or "").strip()
+        if not part:
+            continue
+        if parts and (part in parts[-1] or parts[-1] in part):
+            if len(part) > len(parts[-1]):
+                parts[-1] = part
+            continue
+        parts.append(part)
+    label = "·".join(parts) or name
+    if place.get("coord"):
+        try:
+            lat = float(place.get("lat") or 0)
+            lon = float(place.get("lon") or 0)
+        except (TypeError, ValueError):
+            return label
+        label += f"（{lat:.2f},{lon:.2f}）"
+    return label
+
+
+def short_label(place: dict[str, Any]) -> str:
+    """推送标题里的短名：只要区县名。
+
+    坐标绑定时补上坐标，否则用户看到「和平」不知道指的是哪个点。
+    """
+    name = place.get("name") or "未知位置"
+    if not place.get("coord"):
+        return name
+    try:
+        lat = float(place.get("lat") or 0)
+        lon = float(place.get("lon") or 0)
+    except (TypeError, ValueError):
+        return name
+    return f"{name}({lat:.2f},{lon:.2f})"
+
+
 def header(place: dict[str, Any], moment: datetime | None = None, title: str = "") -> str:
     moment = moment or datetime.now()
-    name = place.get("name") or "未知位置"
-    adm1 = place.get("adm1") or ""
-    label = f"{adm1}·{name}" if adm1 and adm1 not in name else name
+    label = place_label(place)
     stamp = moment.strftime("%m-%d %H:%M")
     return f"【{title or '天气'}｜{label}｜{stamp}】"
 

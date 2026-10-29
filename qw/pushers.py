@@ -39,20 +39,43 @@ HOURLY_CACHE_SECONDS = 3600
 WARNING_LIST_MIN_INTERVAL = 300  # 即使某会话配了 5 分钟，全局列表最快 5 分钟拉一次
 
 
-def location_matches(city: dict[str, Any], ids: set[str]) -> bool:
-    """判断城市是否命中预警列表。
+def _city_level(city: dict[str, Any]) -> str:
+    """绑定的粒度：``city``（市/省）还是 ``district``（区县/坐标）。
 
-    列表是**区县级**粒度：天津市级 ID ``101030100`` 不会出现在列表里，但它下辖区县
-    ``101030200`` 会出现。所以大陆 9 位 ID 必须按前 6 位（省市）前缀匹配。
-    台湾省等地区是 5 位字母数字 ID，只能精确匹配。
+    优先用绑定时算好的 ``level``；老数据没有这个字段，就按「name 是否等于 adm2」现推。
+    两者都缺（更老的记录）时按 ``city`` 处理，退回前缀匹配。
+    """
+    level = str(city.get("level") or "")
+    if level in ("city", "district"):
+        return level
+    name = str(city.get("name") or "")
+    adm2 = str(city.get("adm2") or "")
+    if name and adm2 and name != adm2:
+        return "district"
+    return "city"
+
+
+def location_matches(city: dict[str, Any], ids: set[str]) -> bool:
+    """判断绑定地点是否命中预警列表。
+
+    列表是**区县级**粒度（实测 693 条全是区县，市级 ID 从不出现），所以两种绑定的
+    匹配方式必须不同：
+
+    - 绑定到**市**（天津 101030100）：市级 ID 永远查不到，只能按前 6 位前缀匹配，
+      这样下辖所有区县的预警都能收到。
+    - 绑定到**区县**（武清 101030200）或**坐标**：必须精确匹配。用前缀会退化成「全市
+      预警」，武清的用户会收到和平区 40 公里外的预警，等于白推。
+
+    台湾省等地区是 5 位字母数字 ID，两种方式都是精确匹配。
     """
     cid = str(city.get("id") or "")
     if not cid:
         return False
-    if cid.isdigit() and len(cid) == 9:
-        prefix = cid[:6]
-        return any(i.startswith(prefix) for i in ids)
-    return cid in ids
+    if not (cid.isdigit() and len(cid) == 9):
+        return cid in ids
+    if _city_level(city) == "district":
+        return cid in ids
+    return any(i.startswith(cid[:6]) for i in ids)
 
 
 class Pusher:
@@ -320,7 +343,7 @@ class Pusher:
     @staticmethod
     def _alert_text(city: dict[str, Any], alert: dict[str, Any]) -> str:
         lines = [
-            f"⚠️ 【{city.get('name')}】{alert.get('level')}{alert.get('type_name')}预警",
+            f"⚠️ 【{render.short_label(city)}】{alert.get('level')}{alert.get('type_name')}预警",
             alert.get("title") or "",
             f"发布：{alert.get('sender') or '—'}　{alert.get('start')} 至 {alert.get('end')}",
         ]
@@ -414,7 +437,7 @@ class Pusher:
     @staticmethod
     def _precip_text(city: dict[str, Any], kind: str, minutes: int, summary: str) -> str:
         if kind == "start":
-            head = f"☔ 降水提醒：{city.get('name')} 预计 {minutes} 分钟后开始"
+            head = f"☔ 降水提醒：{render.short_label(city)} 预计 {minutes} 分钟后开始"
         else:
-            head = f"🌤 降水提醒：{city.get('name')} 预计 {minutes} 分钟后停止"
+            head = f"🌤 降水提醒：{render.short_label(city)} 预计 {minutes} 分钟后停止"
         return f"{head}\n{summary}" if summary else head

@@ -17,6 +17,7 @@ v7 是扁平字符串（``"temp": "20"``）且湿度是 0~100 整数。``current
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -82,6 +83,71 @@ def _num(obj: Any) -> float | int | None:
     if isinstance(obj, (int, float)):
         return obj
     return None
+
+
+# ---------------------------------------------------------------- 坐标解析
+
+_COORD_SEP = re.compile(r"[,，;；/\\\s]+")
+# 中国境内经纬度范围（含南海诸岛）。用于判断两个数谁大是谁。
+_CN_LAT = (3.0, 54.0)
+_CN_LON = (73.0, 136.0)
+COORD_DECIMALS = 2
+
+
+def _in(value: float, bounds: tuple[float, float]) -> bool:
+    return bounds[0] <= value <= bounds[1]
+
+
+def parse_latlon(text: str) -> tuple[float, float] | None:
+    """从用户输入解析经纬度，返回 ``(lat, lon)``；不像坐标就返回 ``None``。
+
+    和风接口的 ``location`` 参数是 **经度,纬度**，但用户习惯写 **纬度,经度**。
+    判定顺序：
+
+    1. 有一个数绝对值 > 90 → 它只能是经度，另一个是纬度（无歧义）
+    2. 两个都不超过 90 → 先按中国范围试「纬度,经度」，不成立再试「经度,纬度」
+       （中国经度最小 73、纬度最大 54，两个区间不重叠，不会同时成立）
+    3. 都不在中国范围 → 按用户习惯「纬度,经度」
+
+    小数位截到 2 位：和风文档要求最多两位，且 0.01° ≈ 1.1 km，与后端网格分辨率
+    相当，再多位没有实际意义。
+    """
+    if not text:
+        return None
+    parts = [p for p in _COORD_SEP.split(text.strip()) if p]
+    if len(parts) != 2:
+        return None
+    try:
+        a, b = float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+
+    if abs(a) > 90 >= abs(b):
+        lat, lon = b, a
+    elif abs(b) > 90 >= abs(a):
+        lat, lon = a, b
+    elif abs(a) > 90 and abs(b) > 90:
+        return None
+    elif _in(a, _CN_LAT) and _in(b, _CN_LON):
+        lat, lon = a, b
+    elif _in(b, _CN_LAT) and _in(a, _CN_LON):
+        lat, lon = b, a
+    else:
+        lat, lon = a, b
+
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return round(lat, COORD_DECIMALS), round(lon, COORD_DECIMALS)
+
+
+def format_coord(lat: float, lon: float) -> str:
+    """``(lat, lon)`` → ``"39.13,117.21"``（纬度在前，给人看）。"""
+    return f"{lat:.{COORD_DECIMALS}f},{lon:.{COORD_DECIMALS}f}"
+
+
+def geo_location(lat: float, lon: float) -> str:
+    """``(lat, lon)`` → 和风要求的 ``"经度,纬度"``。"""
+    return f"{lon:.{COORD_DECIMALS}f},{lat:.{COORD_DECIMALS}f}"
 
 
 class QWeatherClient:
@@ -396,8 +462,9 @@ class QWeatherClient:
         data = await self._get(
             "/geo/v2/city/lookup", {"location": name, "number": max(1, min(number, 20))}
         )
-        return [
-            {
+        out: list[dict[str, Any]] = []
+        for x in data.get("location") or []:
+            item = {
                 "name": x.get("name") or "",
                 "id": str(x.get("id") or ""),
                 "adm1": x.get("adm1") or "",
@@ -406,8 +473,20 @@ class QWeatherClient:
                 "lon": float(x.get("lon") or 0),
                 "country": x.get("country") or "",
             }
-            for x in (data.get("location") or [])
-        ]
+            # 「市」的 name 和 adm2 相同（杭州/杭州）；「区县」不同（萧山/杭州）。
+            # 这个区别决定预警怎么匹配，见 pushers.location_matches。
+            item["level"] = "city" if item["name"] == item["adm2"] else "district"
+            out.append(item)
+        return out
+
+    async def reverse_lookup(self, lat: float, lon: float) -> dict[str, Any] | None:
+        """坐标反查最近的行政区（区县级）。
+
+        用途有两个：给坐标点一个可读的名字；拿到 LocationID 用于预警列表的前缀匹配。
+        注意返回的 ``lat``/``lon`` 是**该行政区中心点**，不是用户给的坐标，别拿来查天气。
+        """
+        places = await self.city_lookup(geo_location(lat, lon), 1)
+        return places[0] if places else None
 
     async def finance_summary(self) -> dict[str, Any]:
         """需在控制台给凭据勾选「允许访问财务汇总数据」，否则 403。"""

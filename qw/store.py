@@ -232,8 +232,14 @@ class SubStore:
                 "name": city.get("name") or "",
                 "id": str(city.get("id") or ""),
                 "adm1": city.get("adm1") or "",
+                "adm2": city.get("adm2") or "",
                 "lat": float(city.get("lat") or 0),
                 "lon": float(city.get("lon") or 0),
+                # True 表示用户直接给的是坐标，lat/lon 是精度到 2 位的原始值，
+                # 不是行政区中心点；显示时要标出来，否则用户会以为定位到了区县中心。
+                "coord": bool(city.get("coord")),
+                # city / district：决定预警是按前缀匹配还是精确匹配，见 pushers。
+                "level": "district" if city.get("coord") else str(city.get("level") or "city"),
             }
 
         await self._mutate(umo, _do)

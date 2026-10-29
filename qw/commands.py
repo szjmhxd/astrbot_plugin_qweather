@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
-from . import schedule
+from . import render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore, KeyWizard
 from .store import SubStore, normalize_level
@@ -180,7 +180,7 @@ class Commands:
         city = await self._store.get_city(umo)
         lines: list[str] = []
         if city:
-            lines.append(f"当前城市：{city.get('name')}（{city.get('adm1') or '—'}）")
+            lines.append(f"当前城市：{render.place_label(city)}")
         else:
             lines.append("⚠️ 还没绑定城市，先发「/天气 城市名」")
         lines.append("")
@@ -524,8 +524,8 @@ class Commands:
             except QWeatherError as exc:
                 return f"❌ 查询失败：{exc}"
             if not alerts:
-                return f"{city.get('name')} 当前没有生效预警。"
-            lines = [f"{city.get('name')} 当前 {len(alerts)} 条预警："]
+                return f"{render.short_label(city)} 当前没有生效预警。"
+            lines = [f"{render.short_label(city)} 当前 {len(alerts)} 条预警："]
             for alert in alerts:
                 lines.append(
                     f"· {alert.get('level')}{alert.get('type_name')}　{alert.get('title')}"

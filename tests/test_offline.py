@@ -110,9 +110,15 @@ def install_stubs() -> None:
 install_stubs()
 
 from astrbot_plugin_qweather.qw import jwtlite, render, schedule  # noqa: E402
+from astrbot_plugin_qweather.qw.client import (  # noqa: E402
+    format_coord,
+    geo_location,
+    parse_latlon,
+)
 from astrbot_plugin_qweather.qw.commands import parse_rule  # noqa: E402
 from astrbot_plugin_qweather.qw.keys import KeyStore, KeyWizard  # noqa: E402
 from astrbot_plugin_qweather.qw.pushers import location_matches  # noqa: E402
+from astrbot_plugin_qweather.qw.render import place_label, short_label  # noqa: E402
 from astrbot_plugin_qweather.qw.store import SubStore  # noqa: E402
 
 PASS = FAIL = 0
@@ -405,6 +411,68 @@ def test_location() -> None:
     check("5 位 ID 不做前缀匹配", not location_matches({"id": "77B7"}, {"77B77"}))
     check("空 ID 不命中", not location_matches({}, ids))
 
+    # 区县 / 坐标绑定只能精确匹配，否则会把全市预警都推过来
+    check(
+        "区县绑定命中本区预警",
+        location_matches({"id": "101030200", "name": "武清", "adm2": "天津"}, ids),
+    )
+    check(
+        "区县绑定不吃邻区预警",
+        not location_matches({"id": "101030800", "name": "和平", "adm2": "天津"}, ids),
+    )
+    check(
+        "旧数据缺 level 时按 name/adm2 现推",
+        not location_matches({"id": "101030800", "name": "和平", "adm2": "天津"}, {"101030200"}),
+    )
+    check(
+        "旧数据缺 adm2 时退回前缀匹配",
+        location_matches({"id": "101030100", "name": "天津"}, {"101030200"}),
+    )
+    check(
+        "坐标绑定 level 为 district 时不吃全市",
+        not location_matches(
+            {"id": "101030800", "coord": True, "level": "district"}, {"101030200"}
+        ),
+    )
+
+
+def test_coord() -> None:
+    section("坐标解析")
+    check("经纬度顺序：纬度在前", parse_latlon("39.13,117.21") == (39.13, 117.21))
+    check("经纬度顺序：经度在前", parse_latlon("117.21,39.13") == (39.13, 117.21))
+    check("中文逗号", parse_latlon("39.13，117.21") == (39.13, 117.21))
+    check("空格分隔", parse_latlon("39.13 117.21") == (39.13, 117.21))
+    check("多余空格", parse_latlon("  39.13 ,  117.21 ") == (39.13, 117.21))
+    check("西部经度也能判对", parse_latlon("87.62,43.82") == (43.82, 87.62))
+    check("负数坐标", parse_latlon("-33.87,151.21") == (-33.87, 151.21))
+    check("小数位截到 2 位", parse_latlon("39.12345,117.21999") == (39.12, 117.22))
+    check("城市名不是坐标", parse_latlon("杭州") is None)
+    check("单个数字不是坐标", parse_latlon("39.13") is None)
+    check("三个数字不是坐标", parse_latlon("39.13,117.21,5") is None)
+    check("超范围纬度", parse_latlon("95.0,117.21") is None)
+    check("空串", parse_latlon("") is None)
+
+    # 输出格式：给人看用「纬度,经度」，给和风用「经度,纬度」
+    check("format_coord 给人看", format_coord(39.13, 117.21) == "39.13,117.21")
+    check("geo_location 给和风", geo_location(39.13, 117.21) == "117.21,39.13")
+
+    section("地点标签")
+    city = {"name": "杭州", "adm1": "浙江省", "adm2": "杭州"}
+    check("市：省·市去重", place_label(city) == "浙江省·杭州", place_label(city))
+    district = {"name": "武清", "adm1": "天津市", "adm2": "天津"}
+    check("区县：省·区县", place_label(district) == "天津市·武清", place_label(district))
+    coord = {
+        "name": "和平",
+        "adm1": "天津市",
+        "adm2": "天津",
+        "coord": True,
+        "lat": 39.13,
+        "lon": 117.21,
+    }
+    check("坐标带坐标后缀", place_label(coord) == "天津市·和平（39.13,117.21）", place_label(coord))
+    check("推送短名带坐标", short_label(coord) == "和平(39.13,117.21)", short_label(coord))
+    check("推送短名不带省", short_label(district) == "武清", short_label(district))
+
 
 # ---------------------------------------------------------------- 6. 凭据与引导
 
@@ -564,6 +632,12 @@ def test_plugin_class() -> None:
     check("城市粗筛：挡掉问句", not QWeatherPlugin._looks_like_city("天气怎么样？"))
     check("城市粗筛：挡掉指令", not QWeatherPlugin._looks_like_city("/天气"))
     check("城市粗筛：挡掉长句", not QWeatherPlugin._looks_like_city("今天天津的天气情况怎么样呢"))
+    check("城市粗筛：放行坐标", QWeatherPlugin._looks_like_city("39.13,117.21"))
+    check(
+        "设置坐标时参数不被空格切坏",
+        QWeatherPlugin._strip_command("/天气 设置 39.13 117.21", "天气")
+        == ["设置", "39.13", "117.21"],
+    )
 
     session = QWeatherPlugin._build_session("kook:GroupMessage:123", _FakeSession)
     check(
@@ -589,6 +663,7 @@ def main() -> int:
     test_store()
     test_commands()
     test_location()
+    test_coord()
     test_keys()
     test_render()
     test_plugin_class()

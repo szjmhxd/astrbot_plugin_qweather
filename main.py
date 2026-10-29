@@ -26,7 +26,8 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
-from .qw.client import QWeatherClient, QWeatherError
+from .qw import render
+from .qw.client import QWeatherClient, QWeatherError, parse_latlon
 from .qw.commands import Commands
 from .qw.keys import KeyStore, KeyWizard
 from .qw.pushers import Pusher
@@ -39,6 +40,14 @@ HELP_TEXT = """和风天气：
 /天气 杭州　　　　临时查另一个城市
 /天气 设置 杭州　 绑定 / 更换城市
 /天气 清除　　　　解除绑定
+
+也支持直接给坐标（精度约 1 km）：
+/天气 设置 39.13,117.21　　纬度,经度
+/天气 设置 117.21,39.13　　经度,纬度
+/天气 设置 39.13 117.21　　空格分隔
+　　坐标点会反查出所属区县，名字照常显示，预警按该区县匹配。
+
+城市名最多到区县一级（省 / 市 / 区县），街道乡镇查不到。
 
 推送：
 /天气推送　　　　 定时推送规则
@@ -143,7 +152,10 @@ class QWeatherPlugin(Star):
         if head in ("设置", "set", "绑定"):
             city_name = " ".join(args[1:]).strip()
             if not city_name:
-                yield event.plain_result("用法：/天气 设置 杭州")
+                yield event.plain_result(
+                    "用法：/天气 设置 杭州\n"
+                    "　　　/天气 设置 39.13,117.21　（坐标更精细，精度约 1 km）"
+                )
                 return
             yield event.plain_result(await self._bind_city(umo, city_name))
             return
@@ -249,22 +261,19 @@ class QWeatherPlugin(Star):
         if not self._looks_like_city(text):
             self._pending_city.pop(umo, None)
             return
-        try:
-            client = await self._client_for(umo)
-            places = await client.city_lookup(text, 1)
-        except QWeatherError:
+        place, err = await self._resolve_place(umo, text)
+        if place is None:
             self._pending_city.pop(umo, None)
-            return
-        if not places:
-            self._pending_city.pop(umo, None)
+            if err and not err.startswith("查询失败"):
+                yield event.plain_result(err)
             return
 
         self._pending_city.pop(umo, None)
         event.stop_event()
-        await self._subs.set_city(umo, places[0])
+        await self._subs.set_city(umo, place)
         yield event.plain_result(
-            f"已记住：{places[0]['name']}。以后直接发「/天气」就行。\n\n"
-            + await self._render_now(umo, places[0])
+            f"已记住：{render.place_label(place)}。以后直接发「/天气」就行。\n\n"
+            + await self._render_now(umo, place)
         )
 
     # ---------------------------------------------------------------- 天气实现
@@ -281,34 +290,68 @@ class QWeatherPlugin(Star):
             self._clients[fingerprint] = client
         return client
 
-    async def _bind_city(self, umo: str, name: str) -> str:
+    async def _resolve_place(self, umo: str, text: str) -> tuple[dict[str, Any] | None, str]:
+        """把用户输入变成可查询的地点。
+
+        两种输入：坐标（``39.13,117.21`` / ``117.21,39.13`` / 空格分隔）和城市名。
+        坐标会先反查最近的行政区——名字用来显示，LocationID 用来匹配预警列表，
+        但 ``lat``/``lon`` 保留用户给的原值，不能换成行政区中心点，否则精细度就丢光了。
+        """
+        coord = parse_latlon(text)
+        if coord is None:
+            try:
+                client = await self._client_for(umo)
+                places = await client.city_lookup(text, 1)
+            except QWeatherError as exc:
+                return None, f"查询失败：{exc}"
+            if not places:
+                return None, (
+                    f"没找到「{text}」。\n"
+                    "· 城市只写名字，例如「杭州」「武清」，越级写「天津 武清」查不到\n"
+                    "· 要更精细就发坐标：「/天气 设置 39.13,117.21」"
+                )
+            place = dict(places[0])
+            place["coord"] = False
+            return place, ""
+
+        lat, lon = coord
         try:
             client = await self._client_for(umo)
-            places = await client.city_lookup(name, 1)
+            near = await client.reverse_lookup(lat, lon) or {}
         except QWeatherError as exc:
-            return f"查询失败：{exc}"
-        if not places:
-            return f"没找到「{name}」。只写城市名试试（例如「杭州」），不要带区县或街道。"
-        await self._subs.set_city(umo, places[0])
-        return (
-            f"已绑定：{places[0]['name']}（{places[0].get('adm1') or '—'}）\n\n"
-            + await self._render_now(umo, places[0])
-        )
+            return None, f"查询失败：{exc}"
+        return {
+            "name": near.get("name") or "坐标点",
+            "id": near.get("id") or "",
+            "adm1": near.get("adm1") or "",
+            "adm2": near.get("adm2") or "",
+            "lat": lat,
+            "lon": lon,
+            "coord": True,
+            # 坐标落在区县里，预警按该区县精确匹配，不要退化成全市
+            "level": "district",
+        }, ""
+
+    async def _bind_city(self, umo: str, name: str) -> str:
+        place, err = await self._resolve_place(umo, name)
+        if place is None:
+            return err
+        await self._subs.set_city(umo, place)
+        hint = ""
+        if place.get("coord"):
+            hint = f"\n精度约 1 km（0.01°）。想回到行政区中心就发「/天气 设置 {place['name']}」。"
+        return f"已绑定：{render.place_label(place)}{hint}\n\n" + await self._render_now(umo, place)
 
     async def _query_city(self, umo: str, name: str) -> str:
-        try:
-            client = await self._client_for(umo)
-            places = await client.city_lookup(name, 1)
-        except QWeatherError as exc:
-            return f"查询失败：{exc}"
-        if not places:
-            return f"没找到「{name}」。"
-        text = await self._render_now(umo, places[0])
+        place, err = await self._resolve_place(umo, name)
+        if place is None:
+            return err
+        text = await self._render_now(umo, place)
         bound = await self._subs.get_city(umo)
-        if bound and bound.get("name") != places[0]["name"]:
+        if bound and render.place_label(bound) != render.place_label(place):
             text += (
-                f"\n\n（临时查询，已绑定的还是 {bound['name']}。"
-                f"要改发「/天气 设置 {places[0]['name']}」）"
+                f"\n\n（临时查询，已绑定的还是 {render.place_label(bound)}。"
+                f"要改发「/天气 设置 {name}」）"
             )
         return text
 
@@ -320,7 +363,6 @@ class QWeatherPlugin(Star):
             bundle = await self._commands.fetch_bundle(umo, city, content)
         except QWeatherError as exc:
             return f"查询失败：{exc}"
-        from .qw import render
 
         return render.render_report(city, content, bundle, title="天气")
 
@@ -429,7 +471,12 @@ class QWeatherPlugin(Star):
 
     @staticmethod
     def _looks_like_city(text: str) -> bool:
-        if not text or len(text) > 12:
+        if not text:
+            return False
+        # 坐标里带逗号/空格，会被下面的标点规则挡掉，先单独放行
+        if parse_latlon(text):
+            return True
+        if len(text) > 12:
             return False
         if text[0] in _CMD_PREFIXES:
             return False
