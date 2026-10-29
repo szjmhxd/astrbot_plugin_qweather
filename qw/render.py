@@ -75,7 +75,8 @@ def place_label(place: dict[str, Any]) -> str:
             lon = float(place.get("lon") or 0)
         except (TypeError, ValueError):
             return label
-        label += f"（{lat:.2f},{lon:.2f}）"
+        # 经度在前，和用户输入顺序一致，否则用户会以为保存的坐标被改了
+        label += f"（{lon:.2f},{lat:.2f}）"
     return label
 
 
@@ -92,12 +93,43 @@ def short_label(place: dict[str, Any]) -> str:
         lon = float(place.get("lon") or 0)
     except (TypeError, ValueError):
         return name
-    return f"{name}({lat:.2f},{lon:.2f})"
+    return f"{name}({lon:.2f},{lat:.2f})"
 
 
-def header(place: dict[str, Any], moment: datetime | None = None, title: str = "") -> str:
+def loc_label(loc: dict[str, Any]) -> str:
+    """地址的完整展示名：用户起的别名在前，后面跟行政区全名。"""
+    city = loc.get("city") or {}
+    alias = str(loc.get("name") or "").strip()
+    label = place_label(city)
+    return f"{alias}｜{label}" if alias else label
+
+
+def loc_short(loc: dict[str, Any]) -> str:
+    """推送标题里的短名。多个地址时必须能一眼分清是哪个，所以别名优先。"""
+    city = loc.get("city") or {}
+    alias = str(loc.get("name") or "").strip()
+    short = short_label(city)
+    if not alias:
+        return short
+    return short if alias == short else f"{alias}·{short}"
+
+
+def header(
+    place: dict[str, Any],
+    moment: datetime | None = None,
+    title: str = "",
+    alias: str = "",
+) -> str:
+    """标题行。
+
+    ``alias`` 是用户给地址起的别名。一个会话有多个地址时必须带上，否则用户看到
+    「天津市·和平」分不清这是「家」还是「公司」推的。
+    """
     moment = moment or datetime.now()
     label = place_label(place)
+    alias = (alias or "").strip()
+    if alias and alias not in label:
+        label = f"{alias}｜{label}"
     stamp = moment.strftime("%m-%d %H:%M")
     return f"【{title or '天气'}｜{label}｜{stamp}】"
 
@@ -202,10 +234,11 @@ def render_report(
     *,
     moment: datetime | None = None,
     title: str = "",
+    alias: str = "",
 ) -> str:
     """按 ``content`` 的顺序拼装。缺数据的项自动跳过，不报错。"""
     want = list(content or ["now", "daily"])
-    blocks: list[str] = [header(place, moment, title)]
+    blocks: list[str] = [header(place, moment, title, alias)]
 
     # sun 依赖 daily，提前准备好
     days = bundle.get("daily") or []

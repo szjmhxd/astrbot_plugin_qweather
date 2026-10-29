@@ -2,7 +2,8 @@
 
 功能
 ----
-``/天气``　　　查天气 / 绑定城市
+``/天气``　　　查当前地址的天气
+``/地址``　　　管理多个地址，每个地址有独立的推送方案
 ``/天气推送``　定时推送规则（每天、每周、每月、每小时、日出日落）
 ``/雨雪提醒``　降水开始 / 结束提醒，可配多个可提醒时段
 ``/预警推送``　灾害预警轮询，同一条不重复推、等级升高再推
@@ -27,8 +28,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .qw import render
-from .qw.client import QWeatherClient, QWeatherError, parse_latlon
-from .qw.commands import Commands
+from .qw.client import QWeatherClient, QWeatherError, coord_error, looks_like_coord, parse_latlon
+from .qw.commands import Commands, join_place
 from .qw.keys import KeyStore, KeyWizard
 from .qw.pushers import Pusher
 from .qw.store import SubStore
@@ -36,31 +37,36 @@ from .qw.store import SubStore
 PLUGIN_NAME = "astrbot_plugin_qweather"
 
 HELP_TEXT = """和风天气：
-/天气　　　　　　　查你绑定的城市
-/天气 杭州　　　　临时查另一个城市
-/天气 设置 杭州　 绑定 / 更换城市
-/天气 清除　　　　解除绑定
+/天气　　　　　　　查当前地址的天气
+/天气 杭州　　　　临时查另一个地点
+/天气 设置 杭州　 把当前地址改成杭州
+/天气 清除　　　　删掉当前地址
 
-也支持直接给坐标（精度约 1 km）：
-/天气 设置 39.13,117.21　　纬度,经度
-/天气 设置 117.21,39.13　　经度,纬度
-/天气 设置 39.13 117.21　　空格分隔
-　　坐标点会反查出所属区县，名字照常显示，预警按该区县匹配。
+地址管理（一个会话可以有多个地址，推送方案各自独立）：
+/地址　　　　　　　列出所有地址
+/地址 加 天津　　　新增地址
+/地址 用 2　　　　 切换当前地址
+/地址 删 2　　　　 删除地址
+/地址 帮助　　　　 全部地址指令
 
-城市名最多到区县一级（省 / 市 / 区县），街道乡镇查不到。
+地点可以写城市名或坐标：
+· 城市名最多到区县（省 / 市 / 区县），街道乡镇查不到
+· 坐标写作「经度,纬度」，例如 117.21,39.13（天津），精度约 1 km
+· 坐标会反查出所属区县，名字照常显示，预警按该区县匹配
 
 推送：
-/天气推送　　　　 定时推送规则
+/天气推送　　　　 定时推送规则（作用在当前地址）
 /雨雪提醒　　　　 降水开始 / 结束提醒
 /预警推送　　　　 灾害预警提醒
+　想指定别的地址，在命令里加「地址=2」
 
 配置：
 /key　　　　　　　查看凭据（支持本会话专用 key）
 /额度　　　　　　 余额与请求量"""
 
 ASK_CITY_TEXT = (
-    "你还没告诉我城市。平台不会把用户位置给机器人，所以这一步要你自己说：\n"
-    "直接回复城市名（例如：天津），90 秒内有效，我会记住。"
+    "你还没告诉我地点。平台不会把用户位置给机器人，所以这一步要你自己说：\n"
+    "直接回复城市名（例如：天津）或坐标（117.21,39.13），90 秒内有效，我会记住。"
 )
 
 _SENTENCE_PUNCT = "？?。！!；;，,\n\r"
@@ -83,7 +89,9 @@ class QWeatherPlugin(Star):
             default_pem=self._cfg_str("private_key"),
         )
         self._wizard = KeyWizard(timeout=300)
-        self._commands = Commands(self._subs, self._keys, self._wizard, self._client_for)
+        self._commands = Commands(
+            self._subs, self._keys, self._wizard, self._client_for, self._resolve_place
+        )
         self._pusher = Pusher(self._subs, self._keys, self._client_for, self._send)
 
         self._clients: dict[str, QWeatherClient] = {}
@@ -95,12 +103,12 @@ class QWeatherPlugin(Star):
         await self._subs.load()
         await self._keys.load()
         sessions = await self._subs.all_sessions()
-        with_city = sum(1 for s in sessions.values() if s.get("city"))
-        rules = sum(len(s.get("rules") or []) for s in sessions.values())
+        locations = [loc for s in sessions.values() for loc in s.get("locations") or []]
+        rules = sum(len(loc.get("rules") or []) for loc in locations)
         key_state = "就绪" if self._keys.default_ready else f"未配置（{self._keys.default_error}）"
         logger.info(
-            f"[和风天气] 已启动：{with_city} 个会话绑定了城市，共 {rules} 条推送规则；"
-            f"系统默认 key {key_state}"
+            f"[和风天气] 已启动：{len(locations)} 个地址（{len(sessions)} 个会话），"
+            f"共 {rules} 条推送规则；系统默认 key {key_state}"
         )
         if self._cfg_bool("push_enabled", True):
             self._pusher.start()
@@ -119,7 +127,7 @@ class QWeatherPlugin(Star):
 
     @filter.command("天气")
     async def cmd_weather(self, event: AstrMessageEvent):
-        """查询天气 / 绑定城市"""
+        """查询天气 / 设置当前地址的地点"""
         if not self._cfg_bool("enabled", True):
             yield event.plain_result("和风天气插件已关闭")
             return
@@ -141,36 +149,38 @@ class QWeatherPlugin(Star):
             return
 
         if head in ("清除", "解绑", "删除", "clear"):
-            cleared = await self._subs.clear_city(umo)
-            yield event.plain_result(
-                "已解除城市绑定，推送规则保留（但没有城市不会推送）"
-                if cleared
-                else "你还没有绑定城市，直接发「/天气 城市名」即可"
-            )
+            yield event.plain_result(await self._drop_active(umo))
             return
 
         if head in ("设置", "set", "绑定"):
-            city_name = " ".join(args[1:]).strip()
-            if not city_name:
+            place_text = join_place(args[1:])
+            if not place_text:
                 yield event.plain_result(
                     "用法：/天气 设置 杭州\n"
-                    "　　　/天气 设置 39.13,117.21　（坐标更精细，精度约 1 km）"
+                    "　　　/天气 设置 117.21,39.13　（经度,纬度，精度约 1 km）"
                 )
                 return
-            yield event.plain_result(await self._bind_city(umo, city_name))
+            yield event.plain_result(await self._set_active_place(umo, place_text))
             return
 
         if args:
-            yield event.plain_result(await self._query_city(umo, " ".join(args).strip()))
+            yield event.plain_result(await self._query_place(umo, join_place(args)))
             return
 
-        city = await self._subs.get_city(umo)
-        if city:
-            yield event.plain_result(await self._render_now(umo, city))
+        loc = await self._subs.active(umo)
+        if loc is not None:
+            yield event.plain_result(await self._commands.render_for_location(umo, loc))
             return
 
         self._pending_city[umo] = time.monotonic() + max(15, self._cfg_int("pending_timeout", 90))
         yield event.plain_result(ASK_CITY_TEXT)
+
+    @filter.command("地址")
+    async def cmd_address(self, event: AstrMessageEvent):
+        """地址管理：增删改切换"""
+        umo = self._umo(event)
+        args = self._strip_command(event.message_str, "地址")
+        yield event.plain_result(await self._commands.handle_address(umo, args))
 
     @filter.command("天气推送")
     async def cmd_push(self, event: AstrMessageEvent):
@@ -217,7 +227,7 @@ class QWeatherPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_pending_input(self, event: AstrMessageEvent):
-        """接管「等用户补输入」的消息：key 设置引导、或反问后的城市名。"""
+        """接管「等用户补输入」的消息：key 设置引导、或反问后的地点名。"""
         if not self._cfg_bool("enabled", True):
             return
 
@@ -251,14 +261,14 @@ class QWeatherPlugin(Star):
                 yield event.plain_result(prompt or "")
             return
 
-        # 2) 反问城市后的下一条短文本
+        # 2) 反问后的下一条短文本
         deadline = self._pending_city.get(umo)
         if deadline is None:
             return
         if deadline < time.monotonic():
             self._pending_city.pop(umo, None)
             return
-        if not self._looks_like_city(text):
+        if not self._looks_like_place(text):
             self._pending_city.pop(umo, None)
             return
         place, err = await self._resolve_place(umo, text)
@@ -270,10 +280,13 @@ class QWeatherPlugin(Star):
 
         self._pending_city.pop(umo, None)
         event.stop_event()
-        await self._subs.set_city(umo, place)
+        loc, status = await self._subs.add_location(umo, place)
+        if loc is None:
+            yield event.plain_result(status or "添加地址失败。")
+            return
         yield event.plain_result(
-            f"已记住：{render.place_label(place)}。以后直接发「/天气」就行。\n\n"
-            + await self._render_now(umo, place)
+            f"已记住：{render.loc_label(loc)}。以后直接发「/天气」就行。\n\n"
+            + await self._commands.render_for_location(umo, loc)
         )
 
     # ---------------------------------------------------------------- 天气实现
@@ -293,12 +306,15 @@ class QWeatherPlugin(Star):
     async def _resolve_place(self, umo: str, text: str) -> tuple[dict[str, Any] | None, str]:
         """把用户输入变成可查询的地点。
 
-        两种输入：坐标（``39.13,117.21`` / ``117.21,39.13`` / 空格分隔）和城市名。
+        两种输入：坐标（``经度,纬度``，也接受空格分隔）和城市名。
         坐标会先反查最近的行政区——名字用来显示，LocationID 用来匹配预警列表，
         但 ``lat``/``lon`` 保留用户给的原值，不能换成行政区中心点，否则精细度就丢光了。
         """
         coord = parse_latlon(text)
         if coord is None:
+            # 是「两个数字」但没解析成功，几乎都是顺序写反了，直接给出正确写法
+            if looks_like_coord(text):
+                return None, coord_error(text)
             try:
                 client = await self._client_for(umo)
                 places = await client.city_lookup(text, 1)
@@ -308,7 +324,7 @@ class QWeatherPlugin(Star):
                 return None, (
                     f"没找到「{text}」。\n"
                     "· 城市只写名字，例如「杭州」「武清」，越级写「天津 武清」查不到\n"
-                    "· 要更精细就发坐标：「/天气 设置 39.13,117.21」"
+                    "· 要更精细就发坐标：「117.21,39.13」（经度,纬度）"
                 )
             place = dict(places[0])
             place["coord"] = False
@@ -332,42 +348,69 @@ class QWeatherPlugin(Star):
             "level": "district",
         }, ""
 
-    async def _bind_city(self, umo: str, name: str) -> str:
-        place, err = await self._resolve_place(umo, name)
+    async def _set_active_place(self, umo: str, text: str) -> str:
+        """把当前地址的地点改掉；没有地址就新建一个。"""
+        place, err = await self._resolve_place(umo, text)
         if place is None:
             return err
-        await self._subs.set_city(umo, place)
+
+        current = await self._subs.active(umo)
+        if current is None:
+            loc, status = await self._subs.add_location(umo, place)
+            if loc is None:
+                return status or "添加地址失败。"
+            hint = "\n坐标精度约 1 km（0.01°）。" if place.get("coord") else ""
+            return f"已设为当前位置：{render.loc_label(loc)}{hint}\n\n" + (
+                await self._commands.render_for_location(umo, loc)
+            )
+
+        updated = await self._subs.update_location(umo, current["lid"], {"city": place})
+        if updated is None:
+            return "❌ 地址已被删除，重发「/地址」看看。"
         hint = ""
         if place.get("coord"):
-            hint = f"\n精度约 1 km（0.01°）。想回到行政区中心就发「/天气 设置 {place['name']}」。"
-        return f"已绑定：{render.place_label(place)}{hint}\n\n" + await self._render_now(umo, place)
+            hint = (
+                f"\n坐标精度约 1 km（0.01°）。想回到行政区中心就发「/天气 设置 {place['name']}」。"
+            )
+        return f"已更新当前位置：{render.loc_label(updated)}{hint}\n\n" + (
+            await self._commands.render_for_location(umo, updated)
+        )
 
-    async def _query_city(self, umo: str, name: str) -> str:
-        place, err = await self._resolve_place(umo, name)
+    async def _query_place(self, umo: str, text: str) -> str:
+        place, err = await self._resolve_place(umo, text)
         if place is None:
             return err
-        text = await self._render_now(umo, place)
-        bound = await self._subs.get_city(umo)
-        if bound and render.place_label(bound) != render.place_label(place):
-            text += (
-                f"\n\n（临时查询，已绑定的还是 {render.place_label(bound)}。"
-                f"要改发「/天气 设置 {name}」）"
+        temp = {"lid": "", "name": "", "city": place}
+        text_out = await self._commands.render_for_location(umo, temp)
+        current = await self._subs.active(umo)
+        if current and render.loc_label(current) != render.loc_label(temp):
+            text_out += (
+                f"\n\n（临时查询。当前地址还是 {render.loc_label(current)}，"
+                "要改发「/天气 设置 ...」）"
             )
-        return text
+        return text_out
 
-    async def _render_now(self, umo: str, city: dict[str, Any]) -> str:
-        content = ["now", "daily", "sun"]
-        if self._cfg_bool("include_air", True):
-            content.append("air")
-        try:
-            bundle = await self._commands.fetch_bundle(umo, city, content)
-        except QWeatherError as exc:
-            return f"查询失败：{exc}"
-
-        return render.render_report(city, content, bundle, title="天气")
-
-    async def _clear_city(self, umo: str) -> bool:
-        return await self._subs.clear_city(umo)
+    async def _drop_active(self, umo: str) -> str:
+        current = await self._subs.active(umo)
+        if current is None:
+            return "你还没有地址，直接发「/天气 城市名」即可"
+        locations = await self._subs.locations(umo)
+        if len(locations) > 1:
+            removed = await self._subs.delete_location(umo, current["lid"])
+            still = await self._subs.active(umo)
+            tail = f"\n当前地址：{render.loc_label(still)}" if still else ""
+            return (
+                f"已删除地址：{render.loc_label(removed or current)}{tail}"
+                if removed
+                else "删除失败。"
+            )
+        removed = await self._subs.delete_location(umo, current["lid"])
+        return (
+            f"已删除地址：{render.loc_label(removed or current)}\n"
+            "顺便说一句：只剩一个地址时删掉就等于重置，下次发「/天气」会重新问你地点。"
+            if removed
+            else "删除失败。"
+        )
 
     # ---------------------------------------------------------------- 发送
 
@@ -470,11 +513,11 @@ class QWeatherPlugin(Star):
         )
 
     @staticmethod
-    def _looks_like_city(text: str) -> bool:
+    def _looks_like_place(text: str) -> bool:
         if not text:
             return False
         # 坐标里带逗号/空格，会被下面的标点规则挡掉，先单独放行
-        if parse_latlon(text):
+        if looks_like_coord(text) or parse_latlon(text):
             return True
         if len(text) > 12:
             return False

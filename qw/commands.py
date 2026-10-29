@@ -5,8 +5,14 @@
 
 指令族
 ------
+``/地址``　　　管理多个地址（增删改切换），每个地址有独立的推送方案
 ``/天气推送``  ``/雨雪提醒``  ``/预警推送``  ``/key``  ``/额度``
-另有 ``/天气`` 负责查天气和绑定城市（在 main.py 里，因为要复用 pending 输入机制）。
+另有 ``/天气`` 负责查天气和设置当前地址的地点（在 main.py 里，因为要复用 pending 输入机制）。
+
+地址的作用域规则
+----------------
+所有推送指令默认作用在**当前地址**上；想临时指定别的地址就在命令里加 ``地址=2``，
+不必先切换。这样用户不用为了改一条规则来回切地址。
 """
 
 from __future__ import annotations
@@ -19,11 +25,13 @@ from typing import Any
 from . import render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore, KeyWizard
-from .store import SubStore, normalize_level
+from .store import MAX_LOCATIONS, SubStore, normalize_level
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
+# (umo, 用户输入) -> (地点 dict 或 None, 错误提示)
+PlaceResolver = Callable[[str, str], Awaitable[tuple[dict[str, Any] | None, str]]]
 
-PUSH_HELP = """推送指令：
+PUSH_HELP = """推送指令（作用在当前地址上，加 地址=2 可指定别的地址）：
 /天气推送　　　　　　　　　　列出规则
 /天气推送 加 每天 07:30 内容=now,daily,sun
 /天气推送 加 每周 一,三,五 07:30 内容=daily,air
@@ -35,7 +43,22 @@ PUSH_HELP = """推送指令：
 
 内容可选：now 实况 / daily 预报 / hourly 逐时 / air 空气
 　　　　　indices 指数 / alert 预警 / sun 日出日落 / minutely 降水
+
+地址：/地址 查看与切换，「/地址 加 天津」新增一个地址。
 """
+
+ADDRESS_HELP = """地址指令：一个会话可以有多个地址，每个地址的推送方案各自独立。
+/地址　　　　　　　　　 列出所有地址
+/地址 加 天津　　　　　 添加地址（城市名，最多到区县）
+/地址 加 117.21,39.13　 添加地址（坐标，精度约 1 km）
+/地址 加 天津 名称=公司　带别名，方便区分
+/地址 用 2　　　　　　　切换当前地址（也可以写别名）
+/地址 改 2 名称=家　　　 改别名
+/地址 改 2 地点=武清　　 改绑地点
+/地址 删 2　　　　　　　删除地址及其全部推送方案
+/地址 查 2　　　　　　　查该地址的天气，不切换
+
+推送指令默认作用在当前地址，加「地址=2」可临时指定。"""
 
 LEVEL_LABEL = {"blue": "蓝色", "yellow": "黄色", "orange": "橙色", "red": "红色"}
 
@@ -50,6 +73,9 @@ CONTENT_FETCH = {
     "sun": ("daily",),
     "minutely": ("minutely",),
 }
+
+_NUMERIC = re.compile(r"^-?\d+(?:\.\d+)?$")
+_ADDR_KV = re.compile(r"^地址[=＝](.+)$")
 
 
 def _kv_split(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -66,11 +92,37 @@ def _kv_split(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
                 "time": "时间",
                 "level": "等级",
                 "interval": "间隔",
+                "name": "名称",
+                "place": "地点",
             }
             kv[alias.get(key.lower(), key)] = match.group(2).strip()
         else:
             positional.append(token)
     return positional, kv
+
+
+def _pop_address(tokens: list[str]) -> tuple[list[str], str]:
+    """摘出 ``地址=2`` 这种全局修饰，剩下的才是子命令参数。"""
+    rest: list[str] = []
+    ref = ""
+    for token in tokens:
+        match = _ADDR_KV.match(token)
+        if match:
+            ref = match.group(1).strip()
+        else:
+            rest.append(token)
+    return rest, ref
+
+
+def join_place(tokens: list[str]) -> str:
+    """把地点参数拼回去。
+
+    城市名一般是单个词；坐标允许用空格分隔（``117.21 39.13``），这种要拼成一个串，
+    否则会被当成两个参数。仅当恰好两个 token 都是纯数字时才合并。
+    """
+    if len(tokens) == 2 and all(_NUMERIC.match(t) for t in tokens):
+        return ",".join(tokens)
+    return " ".join(tokens).strip()
 
 
 def parse_rule(tokens: list[str]) -> dict[str, Any]:
@@ -137,83 +189,218 @@ class Commands:
         keys: KeyStore,
         wizard: KeyWizard,
         client_factory: ClientFactory,
+        resolve_place: PlaceResolver | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
         self._wizard = wizard
         self._client = client_factory
+        self._resolve = resolve_place
+
+    # ================================================================ 地址
+
+    async def _target(self, umo: str, ref: str = "") -> tuple[dict[str, Any] | None, str]:
+        """本次操作的地址。``ref`` 为空取当前地址。"""
+        if ref:
+            loc = await self._store.location(umo, ref)
+            if loc is None:
+                return None, f"没找到地址「{ref}」，发「/地址」看列表。"
+            return loc, ""
+        loc = await self._store.active(umo)
+        if loc is None:
+            return None, "⚠️ 还没有地址。先发「/地址 加 天津」建一个。"
+        return loc, ""
+
+    async def handle_address(self, umo: str, args: list[str]) -> str:
+        if args and args[0] in ("帮助", "help", "?", "？"):
+            return ADDRESS_HELP
+
+        head = args[0] if args else ""
+        rest = args[1:]
+
+        if not head or head in ("列表", "ls", "list"):
+            return await self._address_list(umo)
+
+        if head in ("加", "添加", "add"):
+            return await self._add_address(umo, rest)
+
+        if head in ("用", "切换", "选", "use", "switch"):
+            if not rest:
+                return "用法：/地址 用 2（也可以写别名）"
+            loc = await self._store.set_active(umo, rest[0])
+            if loc is None:
+                return f"没找到地址「{rest[0]}」。发「/地址」看列表。"
+            return f"✅ 当前地址已切到：{render.loc_label(loc)}"
+
+        if head in ("删", "删除", "del"):
+            if not rest:
+                return "用法：/地址 删 2"
+            if len(await self._store.locations(umo)) <= 1:
+                loc = await self._store.active(umo)
+                if loc is not None:
+                    return (
+                        "只剩这一个地址，删了就没得查了。\n确实不要的话先加一个新地址，再删这个。"
+                    )
+            removed = await self._store.delete_location(umo, rest[0])
+            if removed is None:
+                return f"没找到地址「{rest[0]}」。"
+            active = await self._store.active(umo)
+            tail = f"\n当前地址：{render.loc_label(active)}" if active else ""
+            return f"🗑 已删除：{render.loc_label(removed)}{tail}"
+
+        if head in ("改", "修改", "edit", "rename"):
+            if not rest:
+                return "用法：/地址 改 2 名称=家　　或　/地址 改 2 地点=武清"
+            ref = rest[0]
+            _, kv = _kv_split(rest[1:])
+            patch: dict[str, Any] = {}
+            if "名称" in kv:
+                patch["name"] = kv["名称"][:20]
+            if "地点" in kv:
+                if self._resolve is None:
+                    return "❌ 改绑地点暂不可用。"
+                place, err = await self._resolve(umo, kv["地点"])
+                if place is None:
+                    return err
+                patch["city"] = place
+            if not patch:
+                return "没看出要改什么。支持：名称= 地点="
+            loc = await self._store.update_location(umo, ref, patch)
+            if loc is None:
+                return f"没找到地址「{ref}」。"
+            hint = "\n（推送规则没动，仍挂在这个地址上）" if "city" in patch else ""
+            return f"✅ 已更新：{render.loc_label(loc)}{hint}"
+
+        if head in ("查", "看", "query"):
+            ref = rest[0] if rest else ""
+            loc, err = await self._target(umo, ref)
+            if loc is None:
+                return err
+            return await self.render_for_location(umo, loc, preview=False)
+
+        return await self._address_list(umo)
+
+    async def _address_list(self, umo: str) -> str:
+        locations = await self._store.locations(umo)
+        if not locations:
+            return "还没有地址。\n\n" + ADDRESS_HELP
+        active = await self._store.active(umo)
+        active_lid = (active or {}).get("lid")
+        lines = ["地址列表（每个地址的推送方案各自独立）："]
+        for idx, loc in enumerate(locations, 1):
+            mark = "▶" if loc.get("lid") == active_lid else "　"
+            tags: list[str] = []
+            rules = loc.get("rules") or []
+            if rules:
+                tags.append(f"{len(rules)} 条推送")
+            if (loc.get("precip") or {}).get("enabled"):
+                tags.append("雨雪开")
+            if (loc.get("alert") or {}).get("enabled"):
+                tags.append("预警开")
+            tail = f"（{'，'.join(tags)}）" if tags else ""
+            lines.append(f"{mark} {idx}. {render.loc_label(loc)}{tail}")
+        lines.append("")
+        lines.append("▶ 是当前地址。「/地址 用 2」切换，「/地址 加 ...」新增。")
+        return "\n".join(lines)
+
+    async def _add_address(self, umo: str, rest: list[str]) -> str:
+        if self._resolve is None:
+            return "❌ 地址解析不可用。"
+        positional, kv = _kv_split(rest)
+        place_text = join_place(positional)
+        if not place_text:
+            return "用法：/地址 加 天津　或　/地址 加 117.21,39.13　或　/地址 加 天津 名称=公司"
+        if len(await self._store.locations(umo)) >= MAX_LOCATIONS:
+            return f"最多 {MAX_LOCATIONS} 个地址，先删掉不用的。"
+        place, err = await self._resolve(umo, place_text)
+        if place is None:
+            return err
+        loc, status = await self._store.add_location(umo, place, kv.get("名称") or "")
+        if loc is None:
+            return status or "添加失败。"
+        if status == "already":
+            return f"这个地点已经有了：{render.loc_label(loc)}（已切为当前地址）"
+        hint = ""
+        if place.get("coord"):
+            hint = "\n坐标精度约 1 km（0.01°）。"
+        return (
+            f"✅ 已添加地址：{render.loc_label(loc)}{hint}\n"
+            f"已设为当前地址，接下来「/天气推送」「/雨雪提醒」「/预警推送」都作用在它上面。\n\n"
+            + await self.render_for_location(umo, loc, preview=False)
+        )
 
     # ================================================================ 推送规则
 
     async def handle_push(self, umo: str, args: list[str]) -> str:
+        args, addr_ref = _pop_address(args)
         if not args or args[0] in ("帮助", "help", "?", "？"):
             return PUSH_HELP
 
         head = args[0]
         rest = args[1:]
+        loc, err = await self._target(umo, addr_ref)
+        if loc is None:
+            return err
 
         if head in ("列表", "ls"):
-            return await self._list_rules(umo)
+            return await self._list_rules(umo, loc)
 
         if head in ("加", "添加", "add"):
-            return await self._add_rule(umo, rest)
+            return await self._add_rule(umo, loc, rest)
 
         if head in ("改", "修改", "edit"):
-            return await self._edit_rule(umo, rest)
+            return await self._edit_rule(umo, loc, rest)
 
         if head in ("开", "启用", "on"):
-            return await self._toggle_rule(umo, rest, True)
+            return await self._toggle_rule(umo, loc, rest, True)
 
         if head in ("关", "关闭", "停用", "off"):
-            return await self._toggle_rule(umo, rest, False)
+            return await self._toggle_rule(umo, loc, rest, False)
 
         if head in ("删", "删除", "del"):
-            return await self._delete_rule(umo, rest)
+            return await self._delete_rule(umo, loc, rest)
 
         if head in ("试", "测试", "test"):
-            return await self._try_rule(umo, rest)
+            return await self._try_rule(umo, loc, rest)
 
         return PUSH_HELP
 
-    async def _list_rules(self, umo: str) -> str:
-        rules = await self._store.list_rules(umo)
-        city = await self._store.get_city(umo)
-        lines: list[str] = []
-        if city:
-            lines.append(f"当前城市：{render.place_label(city)}")
-        else:
-            lines.append("⚠️ 还没绑定城市，先发「/天气 城市名」")
-        lines.append("")
+    async def _list_rules(self, umo: str, loc: dict[str, Any]) -> str:
+        rules = loc.get("rules") or []
+        lines = [f"地址：{render.loc_label(loc)}", ""]
         if not rules:
             lines.append("还没有推送规则。用「/天气推送 加 每天 07:30 内容=now,daily」添加。")
             return "\n".join(lines)
         for idx, rule in enumerate(rules, 1):
             lines.append(schedule.describe_rule(rule, idx))
         lines.append("")
-        lines.append("开/关/删/改/试 后面跟序号。")
+        lines.append("开/关/删/改/试 后面跟序号。别的地址加「地址=2」。")
         return "\n".join(lines)
 
-    async def _add_rule(self, umo: str, rest: list[str]) -> str:
+    async def _add_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         try:
             rule = parse_rule(rest)
         except ValueError as exc:
             return f"❌ {exc}\n\n{PUSH_HELP}"
-        if not await self._store.get_city(umo):
-            return "⚠️ 先绑定城市：发「/天气 城市名」，再配推送。"
 
-        saved = await self._store.add_rule(umo, rule)
-        rules = await self._store.list_rules(umo)
+        saved = await self._store.add_rule(umo, loc["lid"], rule)
+        if saved is None:
+            return "❌ 地址已被删除，重发「/地址」看看。"
+        rules = await self._store.list_rules(umo, loc["lid"])
         idx = next((i for i, r in enumerate(rules, 1) if r.get("id") == saved.get("id")), 0)
-        lines = [f"✅ 已添加规则 {idx}", schedule.describe_rule(saved)]
-        preview = await self._preview_next(umo, saved)
+        lines = [
+            f"✅ 已添加规则 {idx}（{render.loc_label(loc)}）",
+            schedule.describe_rule(saved),
+        ]
+        preview = await self._preview_next(umo, loc, saved)
         if preview:
             lines.append(f"下次触发：{preview}")
         return "\n".join(lines)
 
-    async def _edit_rule(self, umo: str, rest: list[str]) -> str:
+    async def _edit_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
             return "用法：/天气推送 改 1 时间=08:00 内容=now,daily"
-        rule = await self._store.find_rule(umo, rest[0])
+        rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}，发「/天气推送」看列表。"
         _, kv = _kv_split(rest[1:])
@@ -230,46 +417,48 @@ class Commands:
             return f"❌ {exc}"
         if not patch:
             return "没看出要改什么。支持：时间= 内容= 标题="
-        updated = await self._store.update_rule(umo, rule["id"], patch)
+        updated = await self._store.update_rule(umo, loc["lid"], rule["id"], patch)
         return f"✅ 已更新\n{schedule.describe_rule(updated or rule)}"
 
-    async def _toggle_rule(self, umo: str, rest: list[str], enabled: bool) -> str:
+    async def _toggle_rule(
+        self, umo: str, loc: dict[str, Any], rest: list[str], enabled: bool
+    ) -> str:
         if not rest:
             return "用法：/天气推送 开 1"
-        rule = await self._store.find_rule(umo, rest[0])
+        rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
-        updated = await self._store.update_rule(umo, rule["id"], {"enabled": enabled})
+        updated = await self._store.update_rule(umo, loc["lid"], rule["id"], {"enabled": enabled})
         return (
             f"{'✅ 已开启' if enabled else '⏸ 已关闭'}\n{schedule.describe_rule(updated or rule)}"
         )
 
-    async def _delete_rule(self, umo: str, rest: list[str]) -> str:
+    async def _delete_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
             return "用法：/天气推送 删 1"
-        rule = await self._store.find_rule(umo, rest[0])
+        rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
-        await self._store.delete_rule(umo, rule["id"])
+        await self._store.delete_rule(umo, loc["lid"], rule["id"])
         return f"🗑 已删除\n{schedule.describe_rule(rule)}"
 
-    async def _try_rule(self, umo: str, rest: list[str]) -> str:
+    async def _try_rule(self, umo: str, loc: dict[str, Any], rest: list[str]) -> str:
         if not rest:
-            return "用法：/天气推送 试 1（立即按该规则推一次给你看，不发到频道）"
-        rule = await self._store.find_rule(umo, rest[0])
+            return "用法：/天气推送 试 1（立即按该规则渲染一次，不发到频道）"
+        rule = await self._store.find_rule(umo, loc["lid"], rest[0])
         if not rule:
             return f"没找到规则 {rest[0]}。"
-        return await self.render_for_rule(umo, rule, preview=True)
+        return await self.render_for_rule(umo, loc, rule, preview=True)
 
-    async def _preview_next(self, umo: str, rule: dict[str, Any]) -> str:
-        sun = await self._sun_times(umo)
+    async def _preview_next(self, umo: str, loc: dict[str, Any], rule: dict[str, Any]) -> str:
+        sun = await self._sun_times(umo, loc)
         runs = schedule.next_runs(rule, datetime.now(), sun, limit=1)
         return runs[0].strftime("%m-%d %H:%M") if runs else ""
 
-    async def _sun_times(self, umo: str) -> dict[str, str] | None:
+    async def _sun_times(self, umo: str, loc: dict[str, Any]) -> dict[str, str] | None:
         """拿今天的日出日落。solar 规则要它，缓存 30 分钟避免每 30 秒查一次。"""
-        city = await self._store.get_city(umo)
-        if not city:
+        city = loc.get("city") or {}
+        if not city.get("lat"):
             return None
         cache = self.__dict__.setdefault("_sun_cache", {})
         key = f"{city.get('lat')},{city.get('lon')}"
@@ -291,23 +480,41 @@ class Commands:
     # ================================================================ 渲染一次推送
 
     async def render_for_rule(
-        self, umo: str, rule: dict[str, Any], *, preview: bool = False
+        self, umo: str, loc: dict[str, Any], rule: dict[str, Any], *, preview: bool = False
     ) -> str:
-        city = await self._store.get_city(umo)
-        if not city:
-            return "⚠️ 没绑定城市，无法推送。先发「/天气 城市名」"
+        city = loc.get("city") or {}
+        if not city.get("lat"):
+            return "⚠️ 这个地址还没绑地点。"
+        content = rule.get("content") or ["now"]
         try:
-            bundle = await self.fetch_bundle(umo, city, rule.get("content") or ["now"])
+            bundle = await self.fetch_bundle(umo, city, content)
         except QWeatherError as exc:
             return f"❌ 取数据失败：{exc}"
         except Exception as exc:  # noqa: BLE001 推送链路不能因为未知异常整条断掉
             return f"❌ 取数据异常：{type(exc).__name__}: {exc}"
-        from . import render
-
         text = render.render_report(
-            city, rule.get("content") or ["now"], bundle, title=rule.get("title") or "天气"
+            city,
+            content,
+            bundle,
+            title=rule.get("title") or "天气",
+            alias=str(loc.get("name") or ""),
         )
-        return ("（预览）\n" + text) if preview else text
+        if not preview:
+            return text
+        return f"（预览｜{render.loc_label(loc)}）\n" + text
+
+    async def render_for_location(
+        self, umo: str, loc: dict[str, Any], *, preview: bool = False, extra: bool = True
+    ) -> str:
+        city = loc.get("city") or {}
+        content = ["now", "daily", "sun"] + (["air"] if extra else [])
+        try:
+            bundle = await self.fetch_bundle(umo, city, content)
+        except QWeatherError as exc:
+            return f"查询失败：{exc}"
+        return render.render_report(
+            city, content, bundle, title="天气", alias=str(loc.get("name") or "")
+        )
 
     async def fetch_bundle(
         self, umo: str, city: dict[str, Any], content: list[str]
@@ -351,30 +558,38 @@ class Commands:
     # ================================================================ 雨雪提醒
 
     async def handle_precip(self, umo: str, args: list[str]) -> str:
-        cfg = await self._store.get_section(umo, "precip")
+        args, addr_ref = _pop_address(args)
+        loc, err = await self._target(umo, addr_ref)
+        if loc is None:
+            return err
+        lid = loc["lid"]
+        cfg = await self._store.get_section(umo, lid, "precip")
         if not args:
-            return self._precip_view(cfg)
+            return self._precip_view(loc, cfg)
 
         head = args[0]
         rest = args[1:]
 
         if head in ("开", "on"):
-            await self._store.patch_section(umo, "precip", {"enabled": True})
-            return "✅ 雨雪提醒已开启\n" + self._precip_view(
-                await self._store.get_section(umo, "precip")
+            await self._store.patch_section(umo, lid, "precip", {"enabled": True})
+            return (
+                "✅ 雨雪提醒已开启（"
+                + render.loc_label(loc)
+                + "）\n"
+                + self._precip_view(loc, await self._store.get_section(umo, lid, "precip"))
             )
         if head in ("关", "off"):
-            await self._store.patch_section(umo, "precip", {"enabled": False})
-            return "⏸ 雨雪提醒已关闭"
+            await self._store.patch_section(umo, lid, "precip", {"enabled": False})
+            return "⏸ 雨雪提醒已关闭（" + render.loc_label(loc) + "）"
 
         if head in ("加时段", "加"):
             if not rest:
                 return "用法：/雨雪提醒 加时段 08:00-12:00"
             window = self._parse_window(rest[0])
             windows = list(cfg.get("windows") or []) + [window]
-            await self._store.patch_section(umo, "precip", {"windows": windows})
+            await self._store.patch_section(umo, lid, "precip", {"windows": windows})
             return f"✅ 已添加时段 {window['start']}-{window['end']}\n" + self._precip_view(
-                await self._store.get_section(umo, "precip")
+                loc, await self._store.get_section(umo, lid, "precip")
             )
 
         if head in ("列时段", "时段"):
@@ -388,7 +603,7 @@ class Commands:
             if not (0 <= idx < len(windows)):
                 return f"没有第 {rest[0]} 个时段。"
             removed = windows.pop(idx)
-            await self._store.patch_section(umo, "precip", {"windows": windows})
+            await self._store.patch_section(umo, lid, "precip", {"windows": windows})
             return f"🗑 已删除时段 {removed['start']}-{removed['end']}\n" + self._window_list(
                 windows
             )
@@ -397,14 +612,14 @@ class Commands:
             if not rest or not rest[0].isdigit():
                 return "用法：/雨雪提醒 间隔 10（分钟，范围 5-60）"
             value = max(5, min(int(rest[0]), 60))
-            await self._store.patch_section(umo, "precip", {"poll_interval": value})
+            await self._store.patch_section(umo, lid, "precip", {"poll_interval": value})
             return f"✅ 轮询间隔改为 {value} 分钟"
 
         if head in ("提前",):
             if not rest or not rest[0].isdigit():
                 return "用法：/雨雪提醒 提前 60（分钟）"
             value = max(10, min(int(rest[0]), 120))
-            await self._store.patch_section(umo, "precip", {"lead_minutes": value})
+            await self._store.patch_section(umo, lid, "precip", {"lead_minutes": value})
             return f"✅ 提前量改为 {value} 分钟"
 
         for key, labels in (("on_start", ("开始",)), ("on_stop", ("结束",))):
@@ -412,15 +627,16 @@ class Commands:
                 if not rest or rest[0] not in ("开", "关", "on", "off"):
                     return f"用法：/雨雪提醒 {head} 开|关"
                 enabled = rest[0] in ("开", "on")
-                await self._store.patch_section(umo, "precip", {key: enabled})
+                await self._store.patch_section(umo, lid, "precip", {key: enabled})
                 label = "降水开始提醒" if key == "on_start" else "降水结束提醒"
                 return f"✅ {label}已{'开启' if enabled else '关闭'}"
 
-        return self._precip_view(cfg)
+        return self._precip_view(loc, cfg)
 
-    def _precip_view(self, cfg: dict[str, Any]) -> str:
+    def _precip_view(self, loc: dict[str, Any], cfg: dict[str, Any]) -> str:
         return "\n".join(
             [
+                f"地址：{render.loc_label(loc)}",
                 f"雨雪提醒：{'✅ 开启' if cfg.get('enabled') else '⏸ 关闭'}",
                 f"可提醒时段：{schedule.window_text(cfg.get('windows') or [])}",
                 f"降水开始：{'开' if cfg.get('on_start') else '关'}"
@@ -453,27 +669,35 @@ class Commands:
     # ================================================================ 预警推送
 
     async def handle_alert(self, umo: str, args: list[str]) -> str:
-        cfg = await self._store.get_section(umo, "alert")
+        args, addr_ref = _pop_address(args)
+        loc, err = await self._target(umo, addr_ref)
+        if loc is None:
+            return err
+        lid = loc["lid"]
+        cfg = await self._store.get_section(umo, lid, "alert")
         if not args:
-            return self._alert_view(cfg)
+            return self._alert_view(loc, cfg)
 
         head = args[0]
         rest = args[1:]
 
         if head in ("开", "on"):
-            await self._store.patch_section(umo, "alert", {"enabled": True})
-            return "✅ 灾害预警推送已开启\n" + self._alert_view(
-                await self._store.get_section(umo, "alert")
+            await self._store.patch_section(umo, lid, "alert", {"enabled": True})
+            return (
+                "✅ 灾害预警推送已开启（"
+                + render.loc_label(loc)
+                + "）\n"
+                + self._alert_view(loc, await self._store.get_section(umo, lid, "alert"))
             )
         if head in ("关", "off"):
-            await self._store.patch_section(umo, "alert", {"enabled": False})
-            return "⏸ 灾害预警推送已关闭"
+            await self._store.patch_section(umo, lid, "alert", {"enabled": False})
+            return "⏸ 灾害预警推送已关闭（" + render.loc_label(loc) + "）"
 
         if head in ("间隔", "轮询"):
             if not rest or not rest[0].isdigit():
                 return "用法：/预警推送 间隔 60（分钟，范围 5-360）"
             value = max(5, min(int(rest[0]), 360))
-            await self._store.patch_section(umo, "alert", {"poll_interval": value})
+            await self._store.patch_section(umo, lid, "alert", {"poll_interval": value})
             return f"✅ 轮询间隔改为 {value} 分钟"
 
         if head in ("等级", "级别"):
@@ -482,14 +706,14 @@ class Commands:
             level = normalize_level(rest[0])
             if not level:
                 return f"不认识的等级：{rest[0]}（用 蓝/黄/橙/红）"
-            await self._store.patch_section(umo, "alert", {"min_level": level})
+            await self._store.patch_section(umo, lid, "alert", {"min_level": level})
             return f"✅ 最低推送等级：{LEVEL_LABEL[level]}"
 
         if head in ("升级",):
             if not rest or rest[0] not in ("开", "关", "on", "off"):
                 return "用法：/预警推送 升级 开|关"
             enabled = rest[0] in ("开", "on")
-            await self._store.patch_section(umo, "alert", {"notify_on_upgrade": enabled})
+            await self._store.patch_section(umo, lid, "alert", {"notify_on_upgrade": enabled})
             return f"✅ 等级升高再推送：{'开启' if enabled else '关闭'}"
 
         if head in ("加时段", "加"):
@@ -497,7 +721,7 @@ class Commands:
                 return "用法：/预警推送 加时段 07:00-23:00"
             window = self._parse_window(rest[0])
             windows = list(cfg.get("windows") or []) + [window]
-            await self._store.patch_section(umo, "alert", {"windows": windows})
+            await self._store.patch_section(umo, lid, "alert", {"windows": windows})
             return f"✅ 已添加时段 {window['start']}-{window['end']}"
 
         if head in ("删时段", "删"):
@@ -508,36 +732,38 @@ class Commands:
             if not (0 <= idx < len(windows)):
                 return f"没有第 {rest[0]} 个时段。"
             windows.pop(idx)
-            await self._store.patch_section(umo, "alert", {"windows": windows})
+            await self._store.patch_section(umo, lid, "alert", {"windows": windows})
             return self._window_list(windows)
 
         if head in ("列时段", "时段"):
             return self._window_list(cfg.get("windows") or [])
 
         if head in ("测试", "试"):
-            city = await self._store.get_city(umo)
-            if not city:
-                return "⚠️ 先绑定城市：/天气 城市名"
+            city = loc.get("city") or {}
+            if not city.get("lat"):
+                return "⚠️ 这个地址还没绑地点。"
             try:
                 client = await self._client(umo)
                 alerts = await client.warning_now(float(city["lat"]), float(city["lon"]))
             except QWeatherError as exc:
                 return f"❌ 查询失败：{exc}"
+            name = render.loc_short(loc)
             if not alerts:
-                return f"{render.short_label(city)} 当前没有生效预警。"
-            lines = [f"{render.short_label(city)} 当前 {len(alerts)} 条预警："]
+                return f"{name} 当前没有生效预警。"
+            lines = [f"{name} 当前 {len(alerts)} 条预警："]
             for alert in alerts:
                 lines.append(
                     f"· {alert.get('level')}{alert.get('type_name')}　{alert.get('title')}"
                 )
             return "\n".join(lines)
 
-        return self._alert_view(cfg)
+        return self._alert_view(loc, cfg)
 
-    def _alert_view(self, cfg: dict[str, Any]) -> str:
+    def _alert_view(self, loc: dict[str, Any], cfg: dict[str, Any]) -> str:
         level = cfg.get("min_level") or "yellow"
         return "\n".join(
             [
+                f"地址：{render.loc_label(loc)}",
                 f"灾害预警推送：{'✅ 开启' if cfg.get('enabled') else '⏸ 关闭'}",
                 f"轮询间隔：{cfg.get('poll_interval')} 分钟（默认 60）",
                 f"最低推送等级：{LEVEL_LABEL.get(level, level)}",
@@ -571,8 +797,10 @@ class Commands:
         if head in ("校验", "验证", "check"):
             try:
                 client = await self._client(umo)
-                city = await self._store.get_city(umo)
-                lat, lon = (39.08, 117.20) if not city else (float(city["lat"]), float(city["lon"]))
+                loc = await self._store.active(umo)
+                city = (loc or {}).get("city") or {}
+                lat = float(city.get("lat") or 39.13)
+                lon = float(city.get("lon") or 117.21)
                 data = await client.current(lat, lon)
                 return (
                     f"✅ key 有效\n{data.get('text')} {data.get('temp')}°C，"

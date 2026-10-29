@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from datetime import datetime
@@ -111,15 +112,22 @@ install_stubs()
 
 from astrbot_plugin_qweather.qw import jwtlite, render, schedule  # noqa: E402
 from astrbot_plugin_qweather.qw.client import (  # noqa: E402
+    coord_error,
     format_coord,
     geo_location,
+    looks_like_coord,
     parse_latlon,
 )
-from astrbot_plugin_qweather.qw.commands import parse_rule  # noqa: E402
+from astrbot_plugin_qweather.qw.commands import join_place, parse_rule  # noqa: E402
 from astrbot_plugin_qweather.qw.keys import KeyStore, KeyWizard  # noqa: E402
 from astrbot_plugin_qweather.qw.pushers import location_matches  # noqa: E402
-from astrbot_plugin_qweather.qw.render import place_label, short_label  # noqa: E402
-from astrbot_plugin_qweather.qw.store import SubStore  # noqa: E402
+from astrbot_plugin_qweather.qw.render import (  # noqa: E402
+    loc_label,
+    loc_short,
+    place_label,
+    short_label,
+)
+from astrbot_plugin_qweather.qw.store import SubStore, blank_location  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -271,7 +279,7 @@ def test_schedule() -> None:
 
 
 def test_store() -> None:
-    section("存储：规则增删改")
+    section("存储：多地址与规则隔离")
 
     async def run() -> None:
         path = HERE / "_test_data" / "subs_test.json"
@@ -279,61 +287,171 @@ def test_store() -> None:
             path.unlink()
         store = SubStore(path)
         await store.load()
-
         umo = "test:GroupMessage:1"
-        await store.set_city(umo, {"name": "天津", "id": "101030100", "lat": 39.08, "lon": 117.2})
-        city = await store.get_city(umo)
-        check("城市写入读出", city and city["name"] == "天津")
 
-        rule = await store.add_rule(umo, {"kind": "clock", "at": "07:30", "content": ["now"]})
-        check("规则有 id", bool(rule.get("id")))
-        check("默认字段补齐", "enabled" in rule and "minutes" in rule)
+        check("初始没有地址", await store.active(umo) is None)
 
-        found = await store.find_rule(umo, "1")
-        check("按序号 1 能找到", found and found["id"] == rule["id"])
-        found_by_id = await store.find_rule(umo, rule["id"])
-        check("按 id 能找到", found_by_id and found_by_id["id"] == rule["id"])
+        tj = {
+            "name": "天津",
+            "id": "101030100",
+            "adm1": "天津市",
+            "adm2": "天津",
+            "lat": 39.08,
+            "lon": 117.2,
+        }
+        loc, status = await store.add_location(umo, tj)
+        check("添加地址", loc is not None and status == "" and loc["city"]["name"] == "天津")
+        check("地址 id 带 L 前缀", loc["lid"].startswith("L"), loc["lid"])
+        check("新地址自动设为当前", (await store.active(umo))["lid"] == loc["lid"])
 
-        await store.update_rule(umo, rule["id"], {"at": "08:00", "enabled": False})
-        updated = await store.find_rule(umo, rule["id"])
+        dup, status = await store.add_location(umo, tj)
+        check("同一地点不重复添加", status == "already" and len(await store.locations(umo)) == 1)
+        check("重复添加返回已有地址", dup["lid"] == loc["lid"])
+
+        wq = {
+            "name": "武清",
+            "id": "101030200",
+            "adm1": "天津市",
+            "adm2": "天津",
+            "lat": 39.38,
+            "lon": 117.06,
+        }
+        loc2, _ = await store.add_location(umo, wq, "公司")
+        check("多地址", len(await store.locations(umo)) == 2)
+        check("别名保存", loc2["name"] == "公司")
+        check("按 id 找", (await store.location(umo, loc2["lid"]))["lid"] == loc2["lid"])
+        check("按别名找", (await store.location(umo, "公司"))["lid"] == loc2["lid"])
+        check("按序号找", (await store.location(umo, "1"))["lid"] == loc["lid"])
+        check("找不到返回 None", await store.location(umo, "99") is None)
+        check("切换当前", (await store.set_active(umo, "1"))["lid"] == loc["lid"])
+
+        # 规则挂在地址上，互不影响
+        r1 = await store.add_rule(
+            umo, loc["lid"], {"kind": "clock", "at": "07:30", "content": ["now"]}
+        )
+        r2 = await store.add_rule(
+            umo, loc2["lid"], {"kind": "clock", "at": "09:00", "content": ["daily"]}
+        )
+        check("规则有 id", bool(r1.get("id")) and bool(r2.get("id")))
+        check("默认字段补齐", "enabled" in r1 and "minutes" in r1)
+        check(
+            "规则按地址隔离",
+            len(await store.list_rules(umo, loc["lid"])) == 1
+            and len(await store.list_rules(umo, loc2["lid"])) == 1,
+        )
+        check("按序号找规则", (await store.find_rule(umo, loc["lid"], "1"))["id"] == r1["id"])
+        check("按 id 找规则", (await store.find_rule(umo, loc["lid"], r1["id"]))["id"] == r1["id"])
+        check("别的地址查不到这条规则", await store.find_rule(umo, loc2["lid"], r1["id"]) is None)
+
+        await store.update_rule(umo, loc["lid"], r1["id"], {"at": "08:00", "enabled": False})
+        updated = await store.find_rule(umo, loc["lid"], r1["id"])
         check("改时间与开关", updated["at"] == "08:00" and updated["enabled"] is False)
 
-        await store.mark_fired(umo, rule["id"], "2026-10-29 08:00")
-        state = await store.state(umo)
-        check("fired 戳落盘", state["fired"].get(rule["id"]) == "2026-10-29 08:00")
+        # 各地址独立的雨雪 / 预警配置
+        await store.patch_section(umo, loc["lid"], "precip", {"enabled": True, "poll_interval": 5})
+        p1 = await store.get_section(umo, loc["lid"], "precip")
+        p2 = await store.get_section(umo, loc2["lid"], "precip")
+        check("雨雪配置按地址隔离", p1["enabled"] and not p2["enabled"], f"{p1} / {p2}")
+        check("轮询间隔按地址隔离", p1["poll_interval"] == 5 and p2["poll_interval"] == 10)
+        await store.patch_section(umo, loc2["lid"], "alert", {"min_level": "orange"})
+        check(
+            "预警阈值按地址隔离",
+            (await store.get_section(umo, loc2["lid"], "alert"))["min_level"] == "orange"
+            and (await store.get_section(umo, loc["lid"], "alert"))["min_level"] == "yellow",
+        )
 
-        await store.mark_precip_state(umo, "101030100", "wet")
-        state = await store.state(umo)
-        check("降水状态落盘", state["precip"].get("101030100") == "wet")
-
-        await store.remember_alert(umo, "101030100", "aid-1", {"level": "黄色", "at": "now"})
-        state = await store.state(umo)
-        check("预警去重记录", "aid-1" in (state["alerts"].get("101030100") or {}))
+        # 去重状态也按地址隔离
+        await store.mark_fired(umo, loc["lid"], r1["id"], "2026-10-29 08:00")
+        await store.mark_precip_state(umo, loc["lid"], "wet")
+        await store.remember_alert(umo, loc["lid"], "aid-1", {"level": "黄色", "at": "now"})
+        s1 = await store.state(umo, loc["lid"])
+        s2 = await store.state(umo, loc2["lid"])
+        check("fired 落盘", s1["fired"].get(r1["id"]) == "2026-10-29 08:00")
+        check("降水状态落盘", s1["precip"] == "wet")
+        check("预警去重记录", "aid-1" in s1["alerts"])
+        check(
+            "另一个地址状态没被污染",
+            s2["fired"] == {} and s2["precip"] == "dry" and s2["alerts"] == {},
+            str(s2),
+        )
 
         # 重新加载：验证持久化
         store2 = SubStore(path)
         await store2.load()
-        reloaded = await store2.find_rule(umo, rule["id"])
+        check("重启后地址还在", len(await store2.locations(umo)) == 2)
+        check("重启后别名还在", (await store2.location(umo, "公司"))["name"] == "公司")
+        reloaded = await store2.find_rule(umo, loc["lid"], r1["id"])
         check("重启后规则还在", reloaded is not None and reloaded["at"] == "08:00")
-        state2 = await store2.state(umo)
-        check("重启后去重状态还在", state2["fired"].get(rule["id"]) == "2026-10-29 08:00")
+        check(
+            "重启后去重状态还在",
+            (await store2.state(umo, loc["lid"]))["fired"].get(r1["id"]) == "2026-10-29 08:00",
+        )
 
-        ok = await store.delete_rule(umo, rule["id"])
-        check("删除规则", ok and not await store.list_rules(umo))
-        check("删除不解绑城市", (await store.get_city(umo)) is not None)
+        # 删除
+        ok = await store.delete_rule(umo, loc["lid"], r1["id"])
+        check("删除规则", ok and not await store.list_rules(umo, loc["lid"]))
+        check("删规则不动地址", len(await store.locations(umo)) == 2)
+        check(
+            "删规则顺手清 fired",
+            (await store.state(umo, loc["lid"]))["fired"].get(r1["id"]) is None,
+        )
 
-        cleared = await store.clear_city(umo)
-        check("解除城市绑定", cleared and (await store.get_city(umo)) is None)
+        removed = await store.delete_location(umo, "公司")
+        check("按别名删地址", removed is not None and len(await store.locations(umo)) == 1)
+        check("剩下的地址成为当前", (await store.active(umo))["lid"] == loc["lid"])
+
+        renamed = await store.update_location(umo, "1", {"name": "家"})
+        check("改名", renamed["name"] == "家")
+        moved = await store.update_location(umo, "家", {"city": wq})
+        check("改绑地点", moved["city"]["name"] == "武清")
+
+        # 旧结构（v1.1 及以前：一个会话一个 city）自动迁移
+        old = {
+            "sessions": {
+                "old": {
+                    "city": {"name": "天津", "id": "101030100", "lat": 39.08, "lon": 117.2},
+                    "rules": [{"kind": "clock", "at": "07:30", "content": ["now"], "id": "rold01"}],
+                    "precip": {"enabled": True},
+                    "alert": {"enabled": True, "min_level": "orange"},
+                    "state": {
+                        "alerts": {"101030100": {"a1": {"level": "黄色"}}},
+                        "precip": {"101030100": "wet"},
+                        "fired": {"rold01": "2026-10-29 07:30"},
+                    },
+                }
+            }
+        }
+        path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        store4 = SubStore(path)
+        await store4.load()
+        migrated = await store4.active("old")
+        check("旧数据迁移成一个地址", migrated is not None and migrated["city"]["name"] == "天津")
+        check(
+            "迁移保留规则",
+            len(migrated["rules"]) == 1 and migrated["rules"][0]["id"] == "rold01",
+            str(migrated["rules"]),
+        )
+        check("迁移保留开关", migrated["precip"]["enabled"] and migrated["alert"]["enabled"])
+        check("迁移保留预警阈值", migrated["alert"]["min_level"] == "orange")
+        check(
+            "迁移保留去重状态",
+            migrated["state"]["fired"].get("rold01") == "2026-10-29 07:30"
+            and migrated["state"]["precip"] == "wet"
+            and "a1" in migrated["state"]["alerts"],
+            str(migrated["state"]),
+        )
 
         # 脏文件容错
         path.write_text(
-            '{"sessions": {"x": {"rules": [{"kind":"clock","id":"abc"}, "junk"]}}}',
+            '{"sessions": {"x": {"locations": [{"city": {"name": "天津", "lat": 39.08,'
+            ' "lon": 117.2}, "rules": [{"kind":"clock","id":"abc"}, "junk"]}]}}}',
             encoding="utf-8",
         )
         store3 = SubStore(path)
         await store3.load()
-        rules = await store3.list_rules("x")
-        check("脏规则被清理", len(rules) == 1 and rules[0]["kind"] == "clock")
+        loc_x = await store3.active("x")
+        check("脏规则被清理", loc_x is not None and len(loc_x["rules"]) == 1)
+        check("脏数据不影响解析", loc_x["rules"][0]["kind"] == "clock")
 
     asyncio.run(run())
 
@@ -437,23 +555,34 @@ def test_location() -> None:
 
 
 def test_coord() -> None:
-    section("坐标解析")
-    check("经纬度顺序：纬度在前", parse_latlon("39.13,117.21") == (39.13, 117.21))
-    check("经纬度顺序：经度在前", parse_latlon("117.21,39.13") == (39.13, 117.21))
-    check("中文逗号", parse_latlon("39.13，117.21") == (39.13, 117.21))
-    check("空格分隔", parse_latlon("39.13 117.21") == (39.13, 117.21))
-    check("多余空格", parse_latlon("  39.13 ,  117.21 ") == (39.13, 117.21))
-    check("西部经度也能判对", parse_latlon("87.62,43.82") == (43.82, 87.62))
-    check("负数坐标", parse_latlon("-33.87,151.21") == (-33.87, 151.21))
-    check("小数位截到 2 位", parse_latlon("39.12345,117.21999") == (39.12, 117.22))
+    section("坐标解析：固定 经度,纬度")
+    check("经度在前", parse_latlon("117.21,39.13") == (39.13, 117.21))
+    check("中文逗号", parse_latlon("117.21，39.13") == (39.13, 117.21))
+    check("空格分隔", parse_latlon("117.21 39.13") == (39.13, 117.21))
+    check("多余空格", parse_latlon("  117.21 ,  39.13 ") == (39.13, 117.21))
+    check("西部经度照写不猜", parse_latlon("87.62,43.82") == (43.82, 87.62))
+    check("南半球负纬度", parse_latlon("151.21,-33.87") == (-33.87, 151.21))
+    check("小数位截到 2 位", parse_latlon("117.21999,39.12345") == (39.12, 117.22))
     check("城市名不是坐标", parse_latlon("杭州") is None)
-    check("单个数字不是坐标", parse_latlon("39.13") is None)
-    check("三个数字不是坐标", parse_latlon("39.13,117.21,5") is None)
-    check("超范围纬度", parse_latlon("95.0,117.21") is None)
+    check("单个数字不是坐标", parse_latlon("117.21") is None)
+    check("三个数字不是坐标", parse_latlon("117.21,39.13,5") is None)
+    check("写反了：纬度超 90 → 拒绝", parse_latlon("39.13,117.21") is None)
+    check("经度超范围 → 拒绝", parse_latlon("200.0,39.13") is None)
     check("空串", parse_latlon("") is None)
 
-    # 输出格式：给人看用「纬度,经度」，给和风用「经度,纬度」
-    check("format_coord 给人看", format_coord(39.13, 117.21) == "39.13,117.21")
+    section("坐标写错的提示")
+    hint = coord_error("39.13,117.21")
+    check("指出是顺序问题", "经度,纬度" in hint)
+    check("给出可直接照抄的正确写法", "117.21,39.13" in hint, hint)
+    check("完全不是数字时给格式示例", "117.21,39.13" in coord_error("天津"))
+
+    section("坐标形态判断")
+    check("两个数字算坐标形态", looks_like_coord("39.13,117.21"))
+    check("写反了也算坐标形态（好报错）", looks_like_coord("95.0,200.0"))
+    check("城市名不是坐标形态", not looks_like_coord("天津"))
+
+    # 输出格式：输入、展示、请求三处统一「经度,纬度」
+    check("format_coord 经度在前", format_coord(39.13, 117.21) == "117.21,39.13")
     check("geo_location 给和风", geo_location(39.13, 117.21) == "117.21,39.13")
 
     section("地点标签")
@@ -469,9 +598,271 @@ def test_coord() -> None:
         "lat": 39.13,
         "lon": 117.21,
     }
-    check("坐标带坐标后缀", place_label(coord) == "天津市·和平（39.13,117.21）", place_label(coord))
-    check("推送短名带坐标", short_label(coord) == "和平(39.13,117.21)", short_label(coord))
+    check("坐标带坐标后缀", place_label(coord) == "天津市·和平（117.21,39.13）", place_label(coord))
+    check("推送短名带坐标", short_label(coord) == "和平(117.21,39.13)", short_label(coord))
     check("推送短名不带省", short_label(district) == "武清", short_label(district))
+
+    section("地址别名")
+    plain = {"lid": "L1", "name": "", "city": district}
+    aliased = {"lid": "L2", "name": "公司", "city": district}
+    check("没别名就用行政区名", loc_label(plain) == "天津市·武清", loc_label(plain))
+    check("有别名时别名在前", loc_label(aliased) == "公司｜天津市·武清", loc_label(aliased))
+    check("推送短名用别名区分地址", loc_short(aliased) == "公司·武清", loc_short(aliased))
+    check("别名和地名相同时不重复", loc_short({"name": "武清", "city": district}) == "武清")
+
+
+# ---------------------------------------------------------------- 5b. 地址指令
+
+
+def test_address_cmds() -> None:
+    section("地址指令：增删改切换")
+
+    from astrbot_plugin_qweather.qw.client import QWeatherError
+    from astrbot_plugin_qweather.qw.commands import Commands
+
+    async def no_client(_umo: str):
+        raise QWeatherError(0, "测试不联网", "stub")
+
+    seen: dict[str, int] = {}
+
+    async def resolve(_umo: str, text: str):
+        """假的地点解析：名字 → 递增 id，保证确定性（不能用 hash，每个进程都变）。"""
+        if text == "火星":
+            return None, "没找到「火星」。"
+        if text.replace(",", "").replace(".", "").isdigit():
+            lon, lat = (float(x) for x in text.split(","))
+            return {
+                "name": "和平",
+                "id": "101030800",
+                "adm1": "天津市",
+                "adm2": "天津",
+                "lat": lat,
+                "lon": lon,
+                "coord": True,
+            }, ""
+        idx = seen.setdefault(text, len(seen) + 1)
+        return {
+            "name": text,
+            "id": f"101030{idx:03d}",
+            "adm1": "天津市",
+            "adm2": text,
+            "lat": 39.0 + idx / 1000,  # 每个名字经纬度都不同，避免被判定为重复地点
+            "lon": 117.0 + idx / 1000,
+        }, ""
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "cmd_test.json"
+        if path.exists():
+            path.unlink()
+        store = SubStore(path)
+        await store.load()
+        cmd = Commands(store, None, None, no_client, resolve)
+        umo = "test:GroupMessage:addr"
+
+        out = await cmd.handle_address(umo, [])
+        check("没地址时提示加地址", "还没有地址" in out, out[:60])
+
+        out = await cmd.handle_push(umo, ["加", "每天", "07:30"])
+        check("没地址时拒绝加推送规则", "还没有地址" in out, out[:60])
+
+        out = await cmd.handle_address(umo, ["加", "天津"])
+        check("加地址成功", "已添加地址" in out, out[:80])
+        check("加完自动成为当前", len(await store.locations(umo)) == 1)
+
+        out = await cmd.handle_address(umo, ["加", "武清", "名称=公司"])
+        check("加第二个地址带别名", "公司" in out, out[:80])
+        check("别名写进存储", (await store.location(umo, "公司")) is not None)
+
+        out = await cmd.handle_address(umo, ["加", "天津"])
+        check("重复地点提示已存在", "已经有了" in out, out[:80])
+        check("重复地点不新增", len(await store.locations(umo)) == 2)
+
+        out = await cmd.handle_address(umo, ["加", "火星"])
+        check("解析失败时原样报错", "没找到" in out, out[:80])
+
+        out = await cmd.handle_address(umo, [])
+        check("列表标出当前地址", "▶" in out, out[:120])
+        check("列表显示规则数或开关", "地址列表" in out)
+
+        out = await cmd.handle_address(umo, ["用", "1"])
+        check("切换到 1", "已切到" in out and (await store.active(umo))["city"]["name"] == "天津")
+
+        # 规则落到当前地址
+        out = await cmd.handle_push(umo, ["加", "每天", "07:30", "内容=now"])
+        check("规则加到当前地址", "已添加规则" in out, out[:80])
+        check(
+            "当前地址有 1 条规则",
+            len(await store.list_rules(umo, (await store.active(umo))["lid"])) == 1,
+        )
+
+        # 地址= 指定别的地址，不切换当前
+        out = await cmd.handle_push(umo, ["加", "每天", "09:00", "地址=公司"])
+        check("地址= 加到别名地址", "已添加规则" in out, out[:80])
+        check("当前地址没变", (await store.active(umo))["city"]["name"] == "天津")
+        check(
+            "指定的地址拿到了规则",
+            len(await store.list_rules(umo, (await store.location(umo, "公司"))["lid"])) == 1,
+        )
+
+        out = await cmd.handle_push(umo, ["加", "每天", "09:00", "地址=99"])
+        check("地址不存在时报错", "没找到地址" in out, out[:80])
+
+        out = await cmd.handle_precip(umo, ["开"])
+        check("雨雪开关落到当前地址", "已开启" in out and "天津" in out, out[:60])
+
+        out = await cmd.handle_alert(umo, ["等级", "橙"])
+        check("预警等级落到当前地址", "橙色" in out, out[:60])
+
+        out = await cmd.handle_address(umo, ["改", "2", "名称=办公室"])
+        check("改别名", "办公室" in out, out[:80])
+
+        out = await cmd.handle_address(umo, ["删", "办公室"])
+        check("删地址", "已删除" in out and len(await store.locations(umo)) == 1, out[:80])
+
+        out = await cmd.handle_address(umo, ["删", "1"])
+        check("最后一个地址不许删", "只剩这一个地址" in out, out[:80])
+        check("确实没被删掉", len(await store.locations(umo)) == 1)
+
+        out = await cmd.handle_address(umo, ["用", "99"])
+        check("切到不存在的地址报错", "没找到地址" in out, out[:60])
+
+        out = await cmd.handle_address(umo, ["帮助"])
+        check("地址帮助可读", "/地址 加" in out)
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 5c. 推送循环
+
+
+def test_pusher() -> None:
+    section("推送循环：多地址各自触发、不重推")
+
+    from astrbot_plugin_qweather.qw.pushers import Pusher
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def current(self, lat, lon):
+            self.calls.append("current")
+            return {
+                "temp": 20.1,
+                "feels_like": 19.4,
+                "text": "晴",
+                "humidity": 30,
+                "wind_dir": "西",
+                "wind_scale": 3,
+            }
+
+        async def daily(self, lat, lon, days=4):
+            self.calls.append("daily")
+            return [
+                {
+                    "date": "2026-10-30",
+                    "temp_max": 22,
+                    "temp_min": 12,
+                    "text_day": "晴",
+                    "text_night": "多云",
+                    "sunrise": "06:34",
+                    "sunset": "17:14",
+                }
+            ]
+
+        async def hourly(self, lat, lon, hours=12):
+            self.calls.append("hourly")
+            return []
+
+        async def air_now(self, lat, lon):
+            raise AssertionError("这条规则没要 air，不该调用")
+
+        async def indices(self, lat, lon, types):
+            raise AssertionError("这条规则没要 indices，不该调用")
+
+        async def warning_now(self, lat, lon):
+            self.calls.append("warning_now")
+            return []
+
+        async def warning_list(self):
+            self.calls.append("warning_list")
+            return []
+
+        async def minutely(self, lat, lon):
+            self.calls.append("minutely")
+            return {"points": [{"precip": 0}], "summary": ""}
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "pusher_test.json"
+        if path.exists():
+            path.unlink()
+        store = SubStore(path)
+        await store.load()
+        umo = "test:GroupMessage:push"
+
+        at = datetime.now().strftime("%H:%M")
+        home, _ = await store.add_location(
+            umo, {"name": "和平", "id": "101030800", "lat": 39.13, "lon": 117.21}, "家"
+        )
+        work, _ = await store.add_location(
+            umo, {"name": "武清", "id": "101030200", "lat": 39.38, "lon": 117.06}, "公司"
+        )
+        for lid in (home["lid"], work["lid"]):
+            await store.add_rule(umo, lid, {"kind": "clock", "at": at, "content": ["now"]})
+
+        sent: list[tuple[str, str]] = []
+
+        async def send(u: str, text: str) -> bool:
+            sent.append((u, text))
+            return True
+
+        client = FakeClient()
+
+        async def factory(_umo: str):
+            return client
+
+        pusher = Pusher(store, None, factory, send)
+        await pusher._tick()
+
+        check("两个地址各推一次", len(sent) == 2, f"实际 {len(sent)} 条")
+        bodies = "\n".join(t for _, t in sent)
+        check("推送带地址别名", "家" in bodies and "公司" in bodies, bodies[:120])
+        check("推送带实况温度", "20.1" in bodies)
+        check("两条推送内容不同", sent[0][1] != sent[1][1])
+
+        # 同一分钟再 tick 不应该重推
+        await pusher._tick()
+        check("同一分钟不重推", len(sent) == 2, f"实际 {len(sent)} 条")
+
+        # 状态落盘：换一个 store 实例（模拟重启）也不重推
+        store2 = SubStore(path)
+        await store2.load()
+        sent.clear()
+        pusher2 = Pusher(store2, None, factory, send)
+        await pusher2._tick()
+        check("重启后同一分钟不重推", len(sent) == 0, f"实际 {len(sent)} 条")
+
+        # 关掉一条规则只推另一条
+        rules = await store.list_rules(umo, home["lid"])
+        await store.update_rule(umo, home["lid"], rules[0]["id"], {"enabled": False})
+        await store.patch_section(umo, home["lid"], "precip", {"enabled": False})
+        sent.clear()
+        # 清掉 fired 以便重测
+        raw = path.read_text(encoding="utf-8")
+        path.write_text(
+            raw.replace(datetime.now().strftime("%Y-%m-%d %H:%M"), ""), encoding="utf-8"
+        )
+        store4 = SubStore(path)
+        await store4.load()
+        pusher4 = Pusher(store4, None, factory, send)
+        await pusher4._tick()
+        check("关掉的规则不推", len(sent) == 1, f"实际 {len(sent)} 条")
+        check("推的是没关的那个", "公司" in sent[0][1] if sent else False)
+
+        # 没绑地点的地址直接跳过，不该报错
+        broken = blank_location({"name": "", "lat": 0, "lon": 0})
+        check("空地址构造正常", broken["lid"].startswith("L"))
+
+    asyncio.run(run())
 
 
 # ---------------------------------------------------------------- 6. 凭据与引导
@@ -628,16 +1019,58 @@ def test_plugin_class() -> None:
     check(
         "@机器人 前缀被去掉", QWeatherPlugin._strip_command("@bot /天气 杭州", "天气") == ["杭州"]
     )
-    check("城市粗筛：天津", QWeatherPlugin._looks_like_city("天津"))
-    check("城市粗筛：挡掉问句", not QWeatherPlugin._looks_like_city("天气怎么样？"))
-    check("城市粗筛：挡掉指令", not QWeatherPlugin._looks_like_city("/天气"))
-    check("城市粗筛：挡掉长句", not QWeatherPlugin._looks_like_city("今天天津的天气情况怎么样呢"))
-    check("城市粗筛：放行坐标", QWeatherPlugin._looks_like_city("39.13,117.21"))
+    check("地点粗筛：天津", QWeatherPlugin._looks_like_place("天津"))
+    check("地点粗筛：挡掉问句", not QWeatherPlugin._looks_like_place("天气怎么样？"))
+    check("地点粗筛：挡掉指令", not QWeatherPlugin._looks_like_place("/天气"))
+    check("地点粗筛：挡掉长句", not QWeatherPlugin._looks_like_place("今天天津的天气情况怎么样呢"))
+    check("地点粗筛：放行坐标", QWeatherPlugin._looks_like_place("117.21,39.13"))
+    check("地点粗筛：坐标写反也放行（才能报错）", QWeatherPlugin._looks_like_place("39.13,117.21"))
     check(
         "设置坐标时参数不被空格切坏",
-        QWeatherPlugin._strip_command("/天气 设置 39.13 117.21", "天气")
-        == ["设置", "39.13", "117.21"],
+        QWeatherPlugin._strip_command("/天气 设置 117.21 39.13", "天气")
+        == ["设置", "117.21", "39.13"],
     )
+
+    section("地点参数拼合")
+    check("单个城市名", join_place(["天津"]) == "天津")
+    check("空格分隔的坐标拼回一个串", join_place(["117.21", "39.13"]) == "117.21,39.13")
+    check("负数坐标也能拼", join_place(["-33.87", "151.21"]) == "-33.87,151.21")
+    check("两个词的城市名不被当成坐标", join_place(["天津", "武清"]) == "天津 武清")
+    check("空参数", join_place([]) == "")
+
+    section("地址= 修饰解析")
+    from astrbot_plugin_qweather.qw.commands import _pop_address
+
+    rest, ref = _pop_address(["加", "每天", "07:30", "地址=2"])
+    check("摘出地址参数", ref == "2" and rest == ["加", "每天", "07:30"], f"{rest} / {ref}")
+    rest, ref = _pop_address(["开", "地址=公司"])
+    check("地址可以写别名", ref == "公司" and rest == ["开"])
+    rest, ref = _pop_address(["加", "每天", "07:30"])
+    check("没有地址参数时为空", ref == "" and rest == ["加", "每天", "07:30"])
+    rest, ref = _pop_address(["加", "每天", "07:30", "地址=2", "内容=now"])
+    check("和内容= 共存", ref == "2" and "内容=now" in rest, f"{rest} / {ref}")
+
+    class _Cfg(dict):
+        pass
+
+    try:
+        plugin = QWeatherPlugin(
+            None,
+            _Cfg(
+                iss="Q1",
+                sub="S1",
+                kid="K1",
+                host="h.example.com",
+                private_key="",
+                enabled=True,
+                push_enabled=False,
+            ),
+        )
+        check("插件可实例化", plugin._subs is not None and plugin._commands is not None)
+        check("地点解析已注入指令层", plugin._commands._resolve is not None)
+        check("地址指令已就绪", hasattr(plugin._commands, "handle_address"))
+    except Exception as exc:  # noqa: BLE001 构造失败就是部署会炸，必须暴露
+        check("插件可实例化", False, f"{type(exc).__name__}: {exc}")
 
     session = QWeatherPlugin._build_session("kook:GroupMessage:123", _FakeSession)
     check(
@@ -664,6 +1097,8 @@ def main() -> int:
     test_commands()
     test_location()
     test_coord()
+    test_address_cmds()
+    test_pusher()
     test_keys()
     test_render()
     test_plugin_class()

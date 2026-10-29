@@ -88,61 +88,62 @@ def _num(obj: Any) -> float | int | None:
 # ---------------------------------------------------------------- 坐标解析
 
 _COORD_SEP = re.compile(r"[,，;；/\\\s]+")
-# 中国境内经纬度范围（含南海诸岛）。用于判断两个数谁大是谁。
-_CN_LAT = (3.0, 54.0)
-_CN_LON = (73.0, 136.0)
 COORD_DECIMALS = 2
 
 
-def _in(value: float, bounds: tuple[float, float]) -> bool:
-    return bounds[0] <= value <= bounds[1]
-
-
-def parse_latlon(text: str) -> tuple[float, float] | None:
-    """从用户输入解析经纬度，返回 ``(lat, lon)``；不像坐标就返回 ``None``。
-
-    和风接口的 ``location`` 参数是 **经度,纬度**，但用户习惯写 **纬度,经度**。
-    判定顺序：
-
-    1. 有一个数绝对值 > 90 → 它只能是经度，另一个是纬度（无歧义）
-    2. 两个都不超过 90 → 先按中国范围试「纬度,经度」，不成立再试「经度,纬度」
-       （中国经度最小 73、纬度最大 54，两个区间不重叠，不会同时成立）
-    3. 都不在中国范围 → 按用户习惯「纬度,经度」
-
-    小数位截到 2 位：和风文档要求最多两位，且 0.01° ≈ 1.1 km，与后端网格分辨率
-    相当，再多位没有实际意义。
-    """
+def _number_pair(text: str) -> tuple[float, float] | None:
+    """把 ``"117.21,39.13"`` 拆成两个 float；不是两个数就返回 None。"""
     if not text:
         return None
     parts = [p for p in _COORD_SEP.split(text.strip()) if p]
     if len(parts) != 2:
         return None
     try:
-        a, b = float(parts[0]), float(parts[1])
+        return float(parts[0]), float(parts[1])
     except ValueError:
         return None
 
-    if abs(a) > 90 >= abs(b):
-        lat, lon = b, a
-    elif abs(b) > 90 >= abs(a):
-        lat, lon = a, b
-    elif abs(a) > 90 and abs(b) > 90:
-        return None
-    elif _in(a, _CN_LAT) and _in(b, _CN_LON):
-        lat, lon = a, b
-    elif _in(b, _CN_LAT) and _in(a, _CN_LON):
-        lat, lon = b, a
-    else:
-        lat, lon = a, b
 
-    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+def looks_like_coord(text: str) -> bool:
+    """是不是「两个数字」的形态。用来区分「坐标写错了」和「这是个城市名」。"""
+    return _number_pair(text) is not None
+
+
+def parse_latlon(text: str) -> tuple[float, float] | None:
+    """解析坐标，返回 ``(lat, lon)``；不是合法坐标就返回 ``None``。
+
+    顺序**固定为「经度,纬度」**，与和风 API 的 ``location`` 参数一致，也和国际通用写法
+    一致（GeoJSON、Google Maps 都是 lon,lat）。不做自动判序：自动判序看起来聪明，实际
+    会在经度 < 90 的地方（例如乌鲁木齐 87.62）猜错，而且用户永远不知道该按哪个顺序写。
+    写反了会有明确报错，见 :func:`coord_error`。
+
+    小数位截到 2 位：和风文档要求最多两位，且 0.01° ≈ 1.1 km，与后端网格分辨率相当，
+    再多位没有实际意义。
+    """
+    pair = _number_pair(text)
+    if pair is None:
+        return None
+    lon, lat = pair
+    if not (-180.0 <= lon <= 180.0) or not (-90.0 <= lat <= 90.0):
         return None
     return round(lat, COORD_DECIMALS), round(lon, COORD_DECIMALS)
 
 
+def coord_error(text: str) -> str:
+    """坐标写错时给一句能直接照抄的提示。"""
+    pair = _number_pair(text)
+    if pair is None:
+        return "坐标格式是「经度,纬度」，例如 117.21,39.13（天津）。"
+    lon, lat = pair
+    head = "坐标顺序是「经度,纬度」——经度在前，纬度在后。"
+    if abs(lat) > 90 >= abs(lon):
+        return f"{head}\n你写的 {lon:g},{lat:g} 纬度超了 ±90，应该是 {lat:g},{lon:g}。"
+    return f"{head}\n经度范围 ±180、纬度范围 ±90，你写的是 {lon:g},{lat:g}。"
+
+
 def format_coord(lat: float, lon: float) -> str:
-    """``(lat, lon)`` → ``"39.13,117.21"``（纬度在前，给人看）。"""
-    return f"{lat:.{COORD_DECIMALS}f},{lon:.{COORD_DECIMALS}f}"
+    """``(lat, lon)`` → ``"117.21,39.13"``（经度在前，与输入顺序一致）。"""
+    return f"{lon:.{COORD_DECIMALS}f},{lat:.{COORD_DECIMALS}f}"
 
 
 def geo_location(lat: float, lon: float) -> str:

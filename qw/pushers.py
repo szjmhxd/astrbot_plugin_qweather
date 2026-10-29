@@ -3,15 +3,20 @@
 为什么是单循环而不是每条规则一个 task
 --------------------------------------
 规则由用户在对话里随时增删。每规则一个 asyncio.Task 意味着每次改动都要取消重建，
-漏掉一个就是泄漏的 task 在后台继续推东西。单循环每 30 秒把所有会话过一遍，
+漏掉一个就是泄漏的 task 在后台继续推东西。单循环每 30 秒把所有会话的**所有地址**过一遍，
 增删规则只是改了个 list，没有生命周期要管。
+
+多个地址怎么隔离
+----------------
+去重状态、轮询节流、降水干湿状态全部按「会话 + 地址」两个维度存。两个地址绑同一个城市也
+互不影响——用户可能想让「家」和「公司」用不同等级阈值推同一条预警。
 
 三个推送源的成本控制
 --------------------
 - 定时规则：命中才取数，没命中零调用。
-- 灾害预警：``/v7/warning/list?range=cn`` 一次调用覆盖全国所有地区（实测 597 个地区、
-  17KB、130ms），所以无论多少用户，每个轮询周期只花 **1 次** 调用。只有城市真的在列表里
-  才去查详情。
+- 灾害预警：``/v7/warning/list?range=cn`` 一次调用覆盖全国所有地区（实测 693 个地区、
+  17KB、130ms），所以无论多少用户、多少地址，每个轮询周期只花 **1 次** 调用。地址真在
+  列表里才去查详情。
 - 雨雪提醒：先用逐小时预报的降水概率预筛，概率为 0 就整轮跳过，不碰分钟降水接口。
   逐小时结果缓存 1 小时，10 分钟一轮也就 1 次调用。
 """
@@ -98,8 +103,9 @@ class Pusher:
         self._hourly_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._warning_ids: set[str] = set()
         self._warning_at = 0.0
-        self._session_alert_at: dict[str, float] = {}
-        self._session_precip_at: dict[str, float] = {}
+        # key 是 (umo, lid)，两个地址绑同一城市也各算各的
+        self._alert_at: dict[tuple[str, str], float] = {}
+        self._precip_at: dict[tuple[str, str], float] = {}
 
     # ---------------------------------------------------------------- 生命周期
 
@@ -138,29 +144,35 @@ class Pusher:
             return
 
         for umo, session in sessions.items():
-            city = session.get("city")
-            if not city or not city.get("lat"):
-                continue
-
-            await self._run_rules(umo, session, now)
-            await self._run_alerts(umo, session, now)
-            await self._run_precip(umo, session, now)
+            for loc in session.get("locations") or []:
+                city = loc.get("city") or {}
+                if not city.get("lat"):
+                    continue
+                # 一个地址炸了不能连累同会话的其它地址
+                for runner in (self._run_rules, self._run_alerts, self._run_precip):
+                    try:
+                        await runner(umo, loc, now)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"[和风天气] {runner.__name__} 失败"
+                            f"（{umo}/{loc.get('lid')}）：{type(exc).__name__}: {exc}"
+                        )
 
     # ---------------------------------------------------------------- 定时规则
 
-    async def _run_rules(self, umo: str, session: dict[str, Any], now: datetime) -> None:
-        rules = session.get("rules") or []
+    async def _run_rules(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+        rules = loc.get("rules") or []
         if not rules:
             return
-        fired = (session.get("state") or {}).get("fired") or {}
-        city = session["city"]
+        lid = str(loc.get("lid") or "")
+        fired = (loc.get("state") or {}).get("fired") or {}
 
         for rule in rules:
             if not rule.get("enabled", True):
                 continue
             sun = None
             if rule.get("kind") == "solar":
-                sun = await self._get_sun(umo, city)
+                sun = await self._get_sun(umo, loc)
                 if not sun:
                     continue
             stamp = schedule.target_stamp(rule, now, sun)
@@ -169,13 +181,14 @@ class Pusher:
             if fired.get(rule.get("id")) == stamp:
                 continue
 
-            text = await self._render_rule(umo, city, rule)
+            text = await self._render_rule(umo, loc, rule)
             if not text:
                 continue
             if await self._send(umo, text):
-                await self._store.mark_fired(umo, rule["id"], stamp)
+                await self._store.mark_fired(umo, lid, rule["id"], stamp)
 
-    async def _render_rule(self, umo: str, city: dict[str, Any], rule: dict[str, Any]) -> str:
+    async def _render_rule(self, umo: str, loc: dict[str, Any], rule: dict[str, Any]) -> str:
+        city = loc.get("city") or {}
         content = rule.get("content") or ["now", "daily"]
         try:
             bundle = await self._fetch(umo, city, content)
@@ -183,7 +196,12 @@ class Pusher:
             logger.warning(f"[和风天气] 规则 {rule.get('id')} 取数失败：{exc}")
             return ""
         return render.render_report(
-            city, content, bundle, moment=datetime.now(), title=rule.get("title") or "天气"
+            city,
+            content,
+            bundle,
+            moment=datetime.now(),
+            title=rule.get("title") or "天气",
+            alias=str(loc.get("name") or ""),
         )
 
     async def _fetch(self, umo: str, city: dict[str, Any], content: list[str]) -> dict[str, Any]:
@@ -224,8 +242,9 @@ class Pusher:
                 bundle["minutely"] = None
         return bundle
 
-    async def _get_sun(self, umo: str, city: dict[str, Any]) -> dict[str, str] | None:
-        key = f"{city.get('id') or city.get('lat')}"
+    async def _get_sun(self, umo: str, loc: dict[str, Any]) -> dict[str, str] | None:
+        city = loc.get("city") or {}
+        key = f"{city.get('id') or city.get('lat')},{city.get('lon')}"
         cached = self._sun_cache.get(key)
         now_ts = datetime.now().timestamp()
         if cached and now_ts - cached[0] < SUN_CACHE_SECONDS:
@@ -243,25 +262,26 @@ class Pusher:
 
     # ---------------------------------------------------------------- 灾害预警
 
-    async def _run_alerts(self, umo: str, session: dict[str, Any], now: datetime) -> None:
-        cfg = session.get("alert") or {}
+    async def _run_alerts(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+        cfg = loc.get("alert") or {}
         if not cfg.get("enabled"):
             return
         if not schedule.in_windows(now, cfg.get("windows") or []):
             return
 
+        lid = str(loc.get("lid") or "")
+        throttle = (umo, lid)
         interval = max(5, int(cfg.get("poll_interval") or 60)) * 60
-        last = self._session_alert_at.get(umo, 0.0)
         now_ts = now.timestamp()
-        if now_ts - last < interval:
+        if now_ts - self._alert_at.get(throttle, 0.0) < interval:
             return
-        self._session_alert_at[umo] = now_ts
+        self._alert_at[throttle] = now_ts
 
         ids = await self._ensure_warning_list(now_ts)
         if not ids:
             return
 
-        city = session["city"]
+        city = loc.get("city") or {}
         if not location_matches(city, ids):
             return
 
@@ -277,8 +297,7 @@ class Pusher:
 
         min_level = cfg.get("min_level") or "yellow"
         allow_upgrade = bool(cfg.get("notify_on_upgrade", True))
-        state = (session.get("state") or {}).get("alerts") or {}
-        pushed = state.get(str(city.get("id"))) or {}
+        pushed = (loc.get("state") or {}).get("alerts") or {}
 
         for alert in alerts:
             if level_rank(alert.get("level")) < level_rank(min_level):
@@ -308,11 +327,11 @@ class Pusher:
                 ):
                     continue
 
-            text = self._alert_text(city, alert)
+            text = self._alert_text(loc, alert)
             if await self._send(umo, text):
                 await self._store.remember_alert(
                     umo,
-                    str(city.get("id")),
+                    lid,
                     alert_id,
                     {
                         "level": alert.get("level"),
@@ -327,7 +346,10 @@ class Pusher:
         # 用第一个能取到 key 的会话去拉，列表本身与凭据无关
         sessions = await self._store.all_sessions()
         for umo, session in sessions.items():
-            if not (session.get("alert") or {}).get("enabled"):
+            want = any(
+                (loc.get("alert") or {}).get("enabled") for loc in session.get("locations") or []
+            )
+            if not want:
                 continue
             try:
                 client = await self._client(umo)
@@ -341,9 +363,9 @@ class Pusher:
         return self._warning_ids
 
     @staticmethod
-    def _alert_text(city: dict[str, Any], alert: dict[str, Any]) -> str:
+    def _alert_text(loc: dict[str, Any], alert: dict[str, Any]) -> str:
         lines = [
-            f"⚠️ 【{render.short_label(city)}】{alert.get('level')}{alert.get('type_name')}预警",
+            f"⚠️ 【{render.loc_short(loc)}】{alert.get('level')}{alert.get('type_name')}预警",
             alert.get("title") or "",
             f"发布：{alert.get('sender') or '—'}　{alert.get('start')} 至 {alert.get('end')}",
         ]
@@ -354,8 +376,8 @@ class Pusher:
 
     # ---------------------------------------------------------------- 雨雪提醒
 
-    async def _run_precip(self, umo: str, session: dict[str, Any], now: datetime) -> None:
-        cfg = session.get("precip") or {}
+    async def _run_precip(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+        cfg = loc.get("precip") or {}
         if not cfg.get("enabled"):
             return
         if not (cfg.get("on_start") or cfg.get("on_stop")):
@@ -363,23 +385,25 @@ class Pusher:
         if not schedule.in_windows(now, cfg.get("windows") or []):
             return
 
+        lid = str(loc.get("lid") or "")
+        throttle = (umo, lid)
         interval = max(5, int(cfg.get("poll_interval") or 10)) * 60
         now_ts = now.timestamp()
-        if now_ts - self._session_precip_at.get(umo, 0.0) < interval:
+        if now_ts - self._precip_at.get(throttle, 0.0) < interval:
             return
 
-        city = session["city"]
-        state = (session.get("state") or {}).get("precip") or {}
-        was_wet = state.get(str(city.get("id"))) == "wet"
+        city = loc.get("city") or {}
+        state = str((loc.get("state") or {}).get("precip") or "dry")
+        was_wet = state == "wet"
 
         # 预筛：先看逐小时降水概率。干燥且历史也干燥 → 整轮跳过，不碰分钟接口。
         if not was_wet:
             chance = await self._precip_chance(umo, city)
             if chance is not None and chance <= 0:
-                self._session_precip_at[umo] = now_ts
+                self._precip_at[throttle] = now_ts
                 return
 
-        self._session_precip_at[umo] = now_ts
+        self._precip_at[throttle] = now_ts
         try:
             client = await self._client(umo)
             data = await client.minutely(float(city["lat"]), float(city["lon"]))
@@ -406,20 +430,20 @@ class Pusher:
             and start_at is not None
             and start_at <= lead
         ):
-            text = self._precip_text(city, "start", start_at * 5, data.get("summary") or "")
+            text = self._precip_text(loc, "start", start_at * 5, data.get("summary") or "")
         elif was_wet and wet_now and cfg.get("on_stop") and dry_at is not None and dry_at <= lead:
-            text = self._precip_text(city, "stop", dry_at * 5, data.get("summary") or "")
+            text = self._precip_text(loc, "stop", dry_at * 5, data.get("summary") or "")
 
         new_state = "wet" if wet_now else "dry"
         if text and await self._send(umo, text):
-            await self._store.mark_precip_state(umo, str(city.get("id")), new_state)
+            await self._store.mark_precip_state(umo, lid, new_state)
             return
-        if new_state != state.get(str(city.get("id"))):
-            await self._store.mark_precip_state(umo, str(city.get("id")), new_state)
+        if new_state != state:
+            await self._store.mark_precip_state(umo, lid, new_state)
 
     async def _precip_chance(self, umo: str, city: dict[str, Any]) -> int | None:
         """未来 2 小时的最大降水概率。None 表示取不到（那就不要挡着，继续查）。"""
-        key = str(city.get("id") or city.get("lat"))
+        key = f"{city.get('id') or city.get('lat')},{city.get('lon')}"
         cached = self._hourly_cache.get(key)
         now_ts = datetime.now().timestamp()
         if cached and now_ts - cached[0] < HOURLY_CACHE_SECONDS:
@@ -435,9 +459,10 @@ class Pusher:
         return max(probs) if probs else None
 
     @staticmethod
-    def _precip_text(city: dict[str, Any], kind: str, minutes: int, summary: str) -> str:
+    def _precip_text(loc: dict[str, Any], kind: str, minutes: int, summary: str) -> str:
+        name = render.loc_short(loc)
         if kind == "start":
-            head = f"☔ 降水提醒：{render.short_label(city)} 预计 {minutes} 分钟后开始"
+            head = f"☔ 降水提醒：{name} 预计 {minutes} 分钟后开始"
         else:
-            head = f"🌤 降水提醒：{render.short_label(city)} 预计 {minutes} 分钟后停止"
+            head = f"🌤 降水提醒：{name} 预计 {minutes} 分钟后停止"
         return f"{head}\n{summary}" if summary else head
