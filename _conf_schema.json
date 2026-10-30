@@ -39,30 +39,34 @@
     "type": "string",
     "description": "系统默认 key - 开发者 ID（iss）",
     "hint": "控制台 → 设置，Q 开头 10 位，例如 Q1A2B3C4D5。留空则必须由每个会话自己用「/qweather key 设置」。",
-    "default": ""
+    "default": "",
+    "secret": true
   },
   "sub": {
     "type": "string",
     "description": "系统默认 key - 项目 ID（sub）",
     "hint": "控制台 → 项目管理，点进项目后可见。",
-    "default": ""
+    "default": "",
+    "secret": true
   },
   "kid": {
     "type": "string",
     "description": "系统默认 key - 凭据 ID（kid）",
     "hint": "创建凭据并上传公钥后显示的凭据 ID。",
-    "default": ""
+    "default": "",
+    "secret": true
   },
   "host": {
     "type": "string",
     "description": "系统默认 key - API Host",
     "hint": "控制台 → 设置里的专属 Host，形如 ne6yvtne25.re.qweatherapi.com。不要带 https://。（实测 api.qweather.com 目前也能用，但官方口径是用专属 Host，别依赖公共域名。）",
-    "default": ""
+    "default": "",
+    "secret": true
   },
   "private_key": {
     "type": "text",
     "description": "系统默认 key - 私钥 PEM",
-    "hint": "Ed25519 私钥，三行 PEM 全文粘贴。它与控制台上传的公钥必须成对。泄露等于泄露账号，不要外传。",
+    "hint": "Ed25519 私钥，三行 PEM 全文粘贴。它与控制台上传的公钥必须成对。泄露等于泄露账号，不要外传；面板对这种多行文本不做遮罩，录屏演示时注意别展开。",
     "default": ""
   },
   "http_timeout": {

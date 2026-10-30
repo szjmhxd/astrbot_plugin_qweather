@@ -43,6 +43,7 @@ def install_stubs() -> None:
         warning = info
         error = info
         debug = info
+        exception = info
 
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
@@ -1638,6 +1639,36 @@ def test_plugin_class() -> None:
         check("额度推送子指令给帮助", "额度推送 加" in out, out[:80])
         out = "".join(asyncio.run(run_message("/qw 额度 推送 加 每天 09:00")))
         check("额度 推送 也能转发", "已添加" in out, out[:80])
+
+        section("消息入口：认领消息（stop_event）")
+
+        async def run_event(text: str):
+            await plugin._subs.load()
+            event = _FakeEvent(text)
+            out = [item async for item in plugin.on_message(event)]
+            return out, event
+
+        _, ev = asyncio.run(run_event("/qw 帮助"))
+        check("命中前缀后认领这条消息", ev.stopped is True)
+        _, ev = asyncio.run(run_event("/qweather 帮助"))
+        check("前缀不匹配时不动事件", ev.stopped is False)
+        _, ev = asyncio.run(run_event("随便聊两句"))
+        check("闲聊不接管", ev.stopped is False)
+
+        section("消息入口：handler 崩了也要回话")
+
+        original = plugin._commands.handle_address
+
+        async def boom(umo: str, args: list[str]) -> str:
+            raise RuntimeError("模拟内部错误")
+
+        plugin._commands.handle_address = boom
+        try:
+            out = "".join(asyncio.run(run_message("/qw 地址")))
+            check("异常被兜住并给出提示", "这个操作出错了" in out, out[:80])
+            check("提示里带上帮助指令", "/qw 帮助" in out, out[:120])
+        finally:
+            plugin._commands.handle_address = original
     except Exception as exc:  # noqa: BLE001 构造失败就是部署会炸，必须暴露
         check("插件可实例化", False, f"{type(exc).__name__}: {exc}")
     finally:

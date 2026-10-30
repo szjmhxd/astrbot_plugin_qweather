@@ -301,14 +301,21 @@ class QWeatherPlugin(Star):
 
         matched, sub, args = naming.split(text)
         if matched:
+            # 认领这条消息：不再传给其它插件的 handler，也不让 LLM 接着回一遍。
+            # 少了这一步，私聊里发「qweather 天气」（不带 /、不 @）会同时收到插件答案和
+            # 模型的自由发挥。
+            event.stop_event()
             self._pending_city.pop(umo, None)
             self._wizard.cancel(umo)
             async for result in self._dispatch(event, umo, sub, args):
                 yield result
             return
 
-        async for result in self._handle_pending_input(event, umo, text):
-            yield result
+        try:
+            async for result in self._handle_pending_input(event, umo, text):
+                yield result
+        except Exception:  # noqa: BLE001 补输入路径也不能把异常抛回框架
+            logger.exception("[和风天气] 处理待补输入时出错")
 
     async def _dispatch(self, event: AstrMessageEvent, umo: str, sub: str, args: list[str]):
         """子指令分发。写错子指令时给出帮助，而不是沉默。"""
@@ -327,6 +334,11 @@ class QWeatherPlugin(Star):
             result = f"❌ {exc}"
         except QWeatherError as exc:
             result = f"❌ {exc}"
+        except Exception as exc:  # noqa: BLE001 兜底：一个 handler 的 bug 不该让机器人失声
+            logger.exception(f"[和风天气] 执行 {sub} 时出错")
+            result = (
+                f"❌ 这个操作出错了：{exc}\n可以发「{naming.cmd('帮助')}」看用法，或过会儿再试。"
+            )
         if result:
             yield event.plain_result(result)
 
