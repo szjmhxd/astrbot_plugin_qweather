@@ -34,6 +34,7 @@ ProcessStage：LLM 只在 ``is_at_or_wake_command`` 为真且没有发送过消�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -46,6 +47,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .qw import naming, render
+from .qw.card import CardRenderer
 from .qw.client import QWeatherClient, QWeatherError, coord_error, looks_like_coord, parse_latlon
 from .qw.commands import Commands, join_place
 from .qw.keys import KeyStore, KeyWizard
@@ -212,6 +214,11 @@ class QWeatherPlugin(Star):
         )
         # 用量账本：接口只给最近 24 小时，切不出完整的「昨天」，所以自己按天攒
         self._ledger = UsageLedger(data_dir / "usage.json")
+        # 图片卡片：Playwright 在容器里通常没有，检测不到就只发文字（不影响推送）
+        self._cards = CardRenderer(
+            data_dir / "icons",
+            enabled=self._cfg_bool("image_cards", True),
+        )
         self._commands = Commands(
             self._subs,
             self._keys,
@@ -228,10 +235,12 @@ class QWeatherPlugin(Star):
             self._send,
             self._calendar,
             self._ledger,
+            self._cards,
         )
 
         self._clients: dict[str, QWeatherClient] = {}
         self._pending_city: dict[str, float] = {}
+        self._cards_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- 生命周期
 
@@ -278,8 +287,17 @@ class QWeatherPlugin(Star):
         if self._cfg_bool("push_enabled", True):
             self._pusher.start()
 
+        # 图片卡片：Chromium 启动要半秒到两秒，放后台探测，别拖慢 AstrBot 启动。
+        # 探测结果（成功 / 缺 Playwright / 缺浏览器）由 CardRenderer 自己打日志。
+        if self._cfg_bool("image_cards", True):
+            self._cards_task = asyncio.create_task(self._cards.probe())
+
     async def terminate(self) -> None:
         await self._pusher.stop()
+        try:
+            await self._cards.close()  # 关掉 Chromium，否则进程退出前会挂住
+        except Exception:  # noqa: BLE001
+            pass
         for client in self._clients.values():
             try:
                 await client.close()
@@ -602,8 +620,11 @@ class QWeatherPlugin(Star):
 
     # ---------------------------------------------------------------- 发送
 
-    async def _send(self, umo: str, text: str) -> bool:
-        """主动发消息到配置规则的那个会话。
+    async def _send(self, umo: str, text: str, image: bytes | None = None) -> bool:
+        """主动发消息：先文字，再图片。
+
+        分成两条消息发是有意的——图片在有些平台上会失败（大小限制、适配器不带媒体上传），
+        文字先落地至少保证用户拿到了信息。图片发不出去只记日志，不影响返回值。
 
         两条路：优先把 umo 直接交给框架；不行再拆成 ``MessageSesion``。
         拆解路径依赖 ``umo`` 的 ``平台:类型:会话ID`` 结构，AstrBot 各版本稳定，但字段名
@@ -618,8 +639,47 @@ class QWeatherPlugin(Star):
             logger.warning(f"[和风天气] 无法导入消息链：{exc}")
             return False
 
-        chain = MessageChain([Plain(text)])
+        ok = await self._dispatch_chain(umo, MessageChain([Plain(text)]))
+        if ok and image:
+            await self._send_image(umo, image)
+        return ok
 
+    async def _send_image(self, umo: str, png: bytes) -> bool:
+        """发一张 PNG。失败只记日志，绝不影响文字那条。"""
+        try:
+            from astrbot.api.event import MessageChain
+            from astrbot.api.message_components import Image
+        except ImportError:
+            return False
+        path = self._data_dir / "cards"
+        name = f"card_{int(time.time() * 1000)}.png"
+        target = path / name
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(png)
+        except OSError as exc:
+            logger.warning(f"[和风天气] 卡片写入失败：{exc}")
+            return False
+        try:
+            try:
+                component = Image.fromFileSystem(str(target))
+            except Exception:  # noqa: BLE001 老版本没有这个类方法，退回 base64
+                component = Image.fromBytes(png)
+            sent = await self._dispatch_chain(umo, MessageChain([component]))
+            if not sent:
+                logger.info(f"[和风天气] 图片发送失败（{umo}），本轮只发文字")
+            return sent
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"[和风天气] 图片发送异常（{umo}）：{exc}")
+            return False
+        finally:
+            try:
+                target.unlink(missing_ok=True)  # 发完就删，别把 data 目录塞满
+            except OSError:
+                pass
+
+    async def _dispatch_chain(self, umo: str, chain) -> bool:
+        """把一条消息链交给框架，两条路都试。"""
         # 路 1：直接传 umo 字符串（新版框架支持）
         try:
             if await self.context.send_message(umo, chain):

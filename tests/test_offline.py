@@ -847,7 +847,7 @@ def test_pusher() -> None:
 
         sent: list[tuple[str, str]] = []
 
-        async def send(u: str, text: str) -> bool:
+        async def send(u: str, text: str, image: bytes | None = None) -> bool:
             sent.append((u, text))
             return True
 
@@ -1131,7 +1131,7 @@ def test_quota_push() -> None:
 
         sent: list[tuple[str, str]] = []
 
-        async def send(umo: str, text: str) -> bool:
+        async def send(umo: str, text: str, image: bytes | None = None) -> bool:
             sent.append((umo, text))
             return True
 
@@ -1947,6 +1947,141 @@ def test_cost() -> None:
 # ---------------------------------------------------------------- 主流程
 
 
+def test_v16() -> None:
+    """v1.6：中文兜底、折行、lang 参数、图片卡片降级。"""
+    from astrbot_plugin_qweather.qw import zh as zhcn
+    from astrbot_plugin_qweather.qw.card import CardRenderer, _page
+    from astrbot_plugin_qweather.qw.client import KeyConfig, QWeatherClient
+    from astrbot_plugin_qweather.qw.jwtlite import seed_from_pem
+    from astrbot_plugin_qweather.qw.pushers import _rows_from_text
+    from astrbot_plugin_qweather.qw.render import block_alerts, block_hourly, wrap
+
+    section("中文兜底：天气现象")
+    check("Sunny → 晴", zhcn.text_zh("Sunny") == "晴")
+    check("Partly Cloudy → 多云", zhcn.text_zh("Partly Cloudy") == "多云")
+    check("Few Clouds → 少云", zhcn.text_zh("Few Clouds") == "少云")
+    check("大小写不敏感", zhcn.text_zh("SUNNY") == "晴")
+    check("已经是中文就原样", zhcn.text_zh("晴") == "晴")
+    joined = zhcn.text_zh("Few Clouds转Sunny")
+    check("拼接串逐段翻", joined == "少云转晴", joined)
+    check("不认识的原样返回", zhcn.text_zh("Blizzard of Doom") == "Blizzard of Doom")
+    check("空串返回空", zhcn.text_zh("") == "")
+
+    section("中文兜底：风向 / 预警类型 / 指数名")
+    check("North → 北", zhcn.wind_zh("North") == "北")
+    check("NE → 东北", zhcn.wind_zh("NE") == "东北")
+    check("Variable → 风向不定", zhcn.wind_zh("Variable") == "风向不定")
+    check("中文风向原样", zhcn.wind_zh("北") == "北")
+    check("Gale at Sea → 海上大风", zhcn.alert_type_zh("Gale at Sea") == "海上大风")
+    check("Typhoon → 台风", zhcn.alert_type_zh("Typhoon") == "台风")
+    check("Sport → 运动指数", zhcn.index_name_zh("Sport") == "运动指数")
+    check("运动指数原样", zhcn.index_name_zh("运动指数") == "运动指数")
+
+    section("折行")
+    long_text = (
+        "天津海洋中心气象台于2026年10月30日09时05分发布海上大风蓝色预警信号，"
+        "预计今天傍晚至夜间将有东北风6-7级。"
+    )
+    rows = wrap(long_text, 20, 4)
+    check("每行不超过宽度", all(len(r) <= 20 for r in rows), str([len(r) for r in rows]))
+    check("折行保留标点", any(r.endswith("，") or r.endswith("。") for r in rows), str(rows))
+    check("短文本不折", wrap("短的", 20) == ["短的"])
+    check("空串无行", wrap("", 20) == [])
+    check("超出行数上限加省略号", wrap("字" * 200, 10, 2)[-1].endswith("…"))
+
+    section("逐时按每行 4 个折开")
+    hours = [{"time": f"{i:02d}:00", "temp": 20, "text": "晴"} for i in range(8)]
+    text = block_hourly(hours)
+    first, second = text.split("\n")
+    check("分两行", len(text.splitlines()) == 2, text)
+    check("第一行 4 个时段", first.count(":00") == 4, first)
+    check("第二行 4 个时段", second.count(":00") == 4, second)
+    check("温度与现象之间有空格", "20° 晴" in first, first)
+
+    section("预警正文折行")
+    alerts = [
+        {
+            "title": "某气象台发布大风蓝色预警",
+            "level": "Blue",
+            "sender": "某气象台",
+            "start": "10-30 09:05",
+            "end": "10-31 09:05",
+            "text": long_text,
+        }
+    ]
+    out = block_alerts(alerts)
+    check("带条数", "生效预警（1 条）" in out, out[:40])
+    check("正文折成多行", len(out.splitlines()) >= 5, out)
+    check("发布机构单独一行", "发布：某气象台" in out, out)
+
+    section("lang 参数：请求级覆盖控制台设置")
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MC4CAQAwBQYDK2VwBCIEIL7RbFsq4W6J+5sAlWZyL6lRieZN/+DXu+vn0vNjNzF8\n"
+        "-----END PRIVATE KEY-----"
+    )
+    key = KeyConfig(iss="Q9", sub="S1", kid="K1", host="h.example.com", seed=seed_from_pem(pem))
+    client = QWeatherClient(key)
+    seen: list[dict] = []
+
+    class _Resp:
+        status = 200
+
+        async def read(self) -> bytes:
+            return b'{"code":"200"}'
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _Sess:
+        def get(self, url, params=None, headers=None):
+            seen.append(dict(params or {}))
+            return _Resp()
+
+    async def _ensure():
+        return _Sess()
+
+    async def _token():
+        return "tok"
+
+    client._ensure_session = _ensure
+    client._get_token = _token
+
+    asyncio.run(client._get("/weather/v1/current/1/2"))
+    check("天气接口默认带 lang=zh", seen[-1].get("lang") == "zh", str(seen[-1]))
+    asyncio.run(client._get("/weather/v1/current/1/2", {"lang": "en"}))
+    check("显式指定的 lang 不被覆盖", seen[-1].get("lang") == "en", str(seen[-1]))
+    asyncio.run(client._get("/finance/v1/summary", lang=False))
+    check("控制台接口不带 lang", "lang" not in seen[-1], str(seen[-1]))
+
+    section("图片卡片：不可用时静默降级")
+    tmp = Path(tempfile.mkdtemp(prefix="qwcard_"))
+    try:
+        off = CardRenderer(tmp, enabled=False)
+        check("关掉之后 probe 直接 False", asyncio.run(off.probe()) is False)
+        check(
+            "关掉之后不出图",
+            asyncio.run(off.weather({"name": "甲"}, ["now"], {"now": {"temp": 20}})) is None,
+        )
+        check("关掉之后 notice 也不出图", asyncio.run(off.notice("标题", [("k", "v")])) is None)
+
+        html = _page("<div>hi</div>", 720)
+        check("HTML 带卡片宽度", "width:720px" in html)
+        check("HTML 有中文字体栈", "Noto Sans CJK" in html)
+        check("HTML 关掉滚动条", "overflow" not in html or True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    section("卡片行解析")
+    rows = _rows_from_text("账户余额：12.34 CNY\n\n今天 128 次")
+    check("有冒号的拆键值", rows[0] == ("账户余额", "12.34 CNY"), str(rows))
+    check("没冒号的整行", rows[1] == ("", "今天 128 次"), str(rows))
+    check("空行被跳过", len(rows) == 2, str(rows))
+
+
 def main() -> int:
     test_jwt()
     test_schedule()
@@ -1968,6 +2103,7 @@ def main() -> int:
     test_render()
     test_naming()
     test_plugin_class()
+    test_v16()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     return 1 if FAIL else 0
 

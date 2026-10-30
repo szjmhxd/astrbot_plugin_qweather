@@ -24,6 +24,7 @@ from typing import Any
 
 import aiohttp
 
+from . import zh as zhcn
 from .jwtlite import make_jwt
 
 DEFAULT_TIMEOUT = 12.0
@@ -296,11 +297,21 @@ class QWeatherClient:
         *,
         tries: int = 3,
         refresh_on_401: bool = True,
+        lang: bool = True,
     ) -> dict[str, Any]:
-        """GET 一个接口。网络错误重试，业务错误直接抛。"""
+        """GET 一个接口。网络错误重试，业务错误直接抛。
+
+        ``lang=zh`` 是显式加的：控制台项目设置里有一项「语言」，把它改成英文之后所有
+        天气现象都会变成 ``Sunny`` / ``Partly Cloudy``。请求级参数优先于项目设置，所以
+        每个天气接口都带上，用户不用去翻控制台。控制台那三个接口（财务、指标）不吃这个
+        参数，用 ``lang=False`` 跳过。
+        """
         session = await self._ensure_session()
         url = f"https://{self._key.host_clean}{path}"
         last_exc: Exception | None = None
+        query = dict(params or {})
+        if lang:
+            query.setdefault("lang", "zh")
 
         for attempt in range(tries):
             token = await self._get_token()
@@ -308,7 +319,7 @@ class QWeatherClient:
             # 但响应头还留着 Content-Encoding: gzip，再解一次就会 BadGzipFile。
             headers = {"Authorization": f"Bearer {token}"}
             try:
-                async with session.get(url, params=params, headers=headers) as resp:
+                async with session.get(url, params=query, headers=headers) as resp:
                     raw = await resp.read()
                     if raw[:2] == b"\x1f\x8b":  # 万一框架没解压，自己兜一下
                         import gzip
@@ -376,10 +387,10 @@ class QWeatherClient:
         return {
             "temp": _num(data.get("temperature")),
             "feels_like": _num(data.get("feelsLike")),
-            "text": (data.get("condition") or {}).get("text") or "",
+            "text": zhcn.text_zh((data.get("condition") or {}).get("text") or ""),
             "code": (data.get("condition") or {}).get("code") or "",
             "humidity": round(humidity * 100) if isinstance(humidity, (int, float)) else None,
-            "wind_dir": (wind.get("direction") or {}).get("compass") or "",
+            "wind_dir": zhcn.wind_zh((wind.get("direction") or {}).get("compass") or ""),
             "wind_scale": wind.get("scale"),
             "wind_speed": _num(wind.get("speed")),
             "pressure": _num(data.get("pressure")),
@@ -412,15 +423,18 @@ class QWeatherClient:
                     "temp_max": _num(item.get("temperatureMax")),
                     "temp_min": _num(item.get("temperatureMin")),
                     "temp_avg": _num(item.get("temperatureAvg")),
-                    "text_day": (day.get("condition") or {}).get("text") or "",
-                    "text_night": (night.get("condition") or {}).get("text") or "",
+                    "text_day": zhcn.text_zh((day.get("condition") or {}).get("text") or ""),
+                    "text_night": zhcn.text_zh((night.get("condition") or {}).get("text") or ""),
+                    "code_day": str((day.get("condition") or {}).get("code") or ""),
+                    "code_night": str((night.get("condition") or {}).get("code") or ""),
                     "precip_prob": _num((day.get("precipitation") or {}).get("probability")),
                     "precip": _num(((day.get("precipitation") or {}).get("amount")) or {}),
                     "humidity": round(humidity * 100)
                     if isinstance(humidity, (int, float))
                     else None,
-                    "wind_dir": ((day.get("wind") or {}).get("direction") or {}).get("compass")
-                    or "",
+                    "wind_dir": zhcn.wind_zh(
+                        ((day.get("wind") or {}).get("direction") or {}).get("compass") or ""
+                    ),
                     "wind_scale": (day.get("wind") or {}).get("scale"),
                     "uv": item.get("uvIndexMax"),
                     "sunrise": (astro.get("sunrise") or "")[11:16],
@@ -445,7 +459,8 @@ class QWeatherClient:
                 {
                     "time": (item.get("forecastTime") or "")[11:16],
                     "temp": _num(item.get("temperature")),
-                    "text": (item.get("condition") or {}).get("text") or "",
+                    "text": zhcn.text_zh((item.get("condition") or {}).get("text") or ""),
+                    "code": str((item.get("condition") or {}).get("code") or ""),
                     "precip_prob": _num(precip.get("probability")),
                     "precip": _num(precip.get("amount") or {}),
                     "wind_scale": (item.get("wind") or {}).get("scale"),
@@ -496,7 +511,7 @@ class QWeatherClient:
         return [
             {
                 "type": str(d.get("type") or ""),
-                "name": d.get("name") or "",
+                "name": zhcn.index_name_zh(d.get("name") or ""),
                 "level": str(d.get("level") or ""),
                 "category": d.get("category") or "",
                 "text": d.get("text") or "",
@@ -518,7 +533,7 @@ class QWeatherClient:
             "sender": w.get("sender") or "",
             "level": w.get("level") or "",
             "type": str(w.get("type") or ""),
-            "type_name": w.get("typeName") or "",
+            "type_name": zhcn.alert_type_zh(w.get("typeName") or ""),
             "status": w.get("status") or "",
             "related": str(w.get("related") or ""),
             "start": (w.get("startTime") or "")[5:16].replace("T", " "),
@@ -587,8 +602,8 @@ class QWeatherClient:
 
     async def finance_summary(self) -> dict[str, Any]:
         """需在控制台给凭据勾选「允许访问财务汇总数据」，否则 403。"""
-        return await self._get("/finance/v1/summary")
+        return await self._get("/finance/v1/summary", lang=False)
 
     async def metrics_stats(self) -> dict[str, Any]:
-        """最近 24 小时请求量。需勾选「允许访问请求量统计」。"""
-        return await self._get("/metrics/v1/stats")
+        """最近 24 小时请求量。需勾选「允许访问请求量汇总统计」，否则 403。"""
+        return await self._get("/metrics/v1/stats", lang=False)

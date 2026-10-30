@@ -11,6 +11,12 @@
     "hint": "关掉后只保留查询功能，定时推送、雨雪提醒、预警推送全部停止。调试配置时可以先关掉。",
     "default": true
   },
+  "image_cards": {
+    "description": "推送时附一张图片卡片",
+    "type": "bool",
+    "hint": "需要装 Playwright 和 Chromium（pip install playwright && playwright install chromium）。装了就自动开启；没装会自动跳过，只发文字，不会报错。图片会紧跟在文字后面单独发一条。",
+    "default": true
+  },
   "command_prefix": {
     "type": "string",
     "description": "指令前缀",

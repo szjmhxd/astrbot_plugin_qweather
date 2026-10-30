@@ -33,12 +33,13 @@ from astrbot.api import logger
 from . import quota, render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore
-from .store import SubStore, level_rank, level_text
+from .store import SubStore, level_key, level_rank, level_text
 from .usage import UsageLedger
 from .workday import WorkdayCalendar
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
-Sender = Callable[[str, str], Awaitable[bool]]
+# ``send(umo, text, image)``：image 是 PNG bytes 或 None。先发文字，图片有就再发一条。
+Sender = Callable[[str, str, "bytes | None"], Awaitable[bool]]
 
 TICK_SECONDS = 30
 SUN_CACHE_SECONDS = 1800
@@ -85,6 +86,33 @@ def location_matches(city: dict[str, Any], ids: set[str]) -> bool:
     return any(i.startswith(cid[:6]) for i in ids)
 
 
+ALERT_COLORS = {
+    "blue": "#2f6df6",
+    "yellow": "#e0a800",
+    "orange": "#f58319",
+    "red": "#e5484d",
+}
+
+
+def _alert_color(level: Any) -> str:
+    return ALERT_COLORS.get(level_key(str(level or "")), ALERT_COLORS["blue"])
+
+
+def _rows_from_text(text: str) -> list[tuple[str, str]]:
+    """``键：值`` 逐行拆开，给卡片用。没有冒号的行整行显示。"""
+    rows: list[tuple[str, str]] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if "：" in line and len(line) <= 72:
+            key, value = line.split("：", 1)
+            rows.append((key, value))
+        else:
+            rows.append(("", line))
+    return rows
+
+
 class Pusher:
     def __init__(
         self,
@@ -94,6 +122,7 @@ class Pusher:
         send: Sender,
         calendar: WorkdayCalendar | None = None,
         ledger: UsageLedger | None = None,
+        cards: Any = None,
     ) -> None:
         self._store = store
         self._keys = keys
@@ -101,6 +130,7 @@ class Pusher:
         self._send = send
         self._calendar = calendar
         self._ledger = ledger
+        self._cards = cards
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -210,8 +240,26 @@ class Pusher:
             text = await self._quota_text(umo)
             if not text:
                 continue
-            if await self._send(umo, text):
+            png = await self._notice("额度报告", _rows_from_text(text), footer="数据来自控制台 API")
+            if await self._send(umo, text, png):
                 await self._store.mark_quota_fired(umo, rule["id"], stamp)
+
+    async def _notice(
+        self,
+        title: str,
+        rows: list[tuple[str, str]],
+        *,
+        footer: str = "",
+        accent: str = "#2f6df6",
+    ) -> bytes | None:
+        """出一张通用卡片。没有 Playwright 时返回 None，调用方照常发文字。"""
+        if self._cards is None or not rows:
+            return None
+        try:
+            return await self._cards.notice(title, rows, footer=footer, accent=accent)
+        except Exception as exc:  # noqa: BLE001 出图失败不影响文字
+            logger.warning(f"[和风天气] 卡片渲染失败：{exc}")
+            return None
 
     async def _quota_text(self, umo: str) -> str:
         try:
@@ -256,28 +304,35 @@ class Pusher:
             if fired.get(rule.get("id")) == stamp:
                 continue
 
-            text = await self._render_rule(umo, loc, rule)
+            text, png = await self._render_rule(umo, loc, rule)
             if not text:
                 continue
-            if await self._send(umo, text):
+            if await self._send(umo, text, png):
                 await self._store.mark_fired(umo, lid, rule["id"], stamp)
 
-    async def _render_rule(self, umo: str, loc: dict[str, Any], rule: dict[str, Any]) -> str:
+    async def _render_rule(
+        self, umo: str, loc: dict[str, Any], rule: dict[str, Any]
+    ) -> tuple[str, bytes | None]:
         city = loc.get("city") or {}
         content = rule.get("content") or ["now", "daily"]
         try:
             bundle = await self._fetch(umo, city, content)
         except QWeatherError as exc:
             logger.warning(f"[和风天气] 规则 {rule.get('id')} 取数失败：{exc}")
-            return ""
-        return render.render_report(
-            city,
-            content,
-            bundle,
-            moment=datetime.now(),
-            title=rule.get("title") or "天气",
-            alias=str(loc.get("name") or ""),
-        )
+            return "", None
+        moment = datetime.now()
+        title = rule.get("title") or "天气"
+        alias = str(loc.get("name") or "")
+        text = render.render_report(city, content, bundle, moment=moment, title=title, alias=alias)
+        png = None
+        if self._cards is not None:
+            try:
+                png = await self._cards.weather(
+                    city, content, bundle, moment=moment, title=title, alias=alias
+                )
+            except Exception as exc:  # noqa: BLE001 出图失败不影响文字
+                logger.warning(f"[和风天气] 天气卡片渲染失败：{exc}")
+        return text, png
 
     async def _fetch(self, umo: str, city: dict[str, Any], content: list[str]) -> dict[str, Any]:
         client = await self._client(umo)
@@ -405,7 +460,18 @@ class Pusher:
                         continue
 
             text = self._alert_text(loc, alert, previous or pushed.get(alert.get("related") or ""))
-            if await self._send(umo, text):
+            png = await self._notice(
+                f"{level_text(str(alert.get('level') or ''))}{alert.get('type_name') or ''}预警",
+                [
+                    ("地点", render.loc_short(loc)),
+                    ("等级", level_text(str(alert.get("level") or ""))),
+                    ("发布", str(alert.get("sender") or "—")),
+                    ("时间", f"{alert.get('start') or '—'} → {alert.get('end') or '—'}"),
+                ],
+                footer=str(alert.get("title") or ""),
+                accent=_alert_color(alert.get("level")),
+            )
+            if await self._send(umo, text, png):
                 await self._store.remember_alert(
                     umo,
                     lid,
@@ -517,6 +583,8 @@ class Pusher:
         )
 
         text = ""
+        kind = ""
+        minutes = 0
         if (
             not was_wet
             and not wet_now
@@ -524,14 +592,27 @@ class Pusher:
             and start_at is not None
             and start_at <= lead
         ):
-            text = self._precip_text(loc, "start", start_at * 5, data.get("summary") or "")
+            kind, minutes = "start", start_at * 5
+            text = self._precip_text(loc, kind, minutes, data.get("summary") or "")
         elif was_wet and wet_now and cfg.get("on_stop") and dry_at is not None and dry_at <= lead:
-            text = self._precip_text(loc, "stop", dry_at * 5, data.get("summary") or "")
+            kind, minutes = "stop", dry_at * 5
+            text = self._precip_text(loc, kind, minutes, data.get("summary") or "")
 
         new_state = "wet" if wet_now else "dry"
-        if text and await self._send(umo, text):
-            await self._store.mark_precip_state(umo, lid, new_state)
-            return
+        if text:
+            png = await self._notice(
+                "降水提醒",
+                [
+                    ("地点", render.loc_short(loc)),
+                    ("预计", f"{minutes} 分钟后{'开始' if kind == 'start' else '停止'}"),
+                    ("说明", data.get("summary") or ""),
+                ],
+                footer="数据来源：和风天气分钟级降水",
+                accent="#2f6df6",
+            )
+            if await self._send(umo, text, png):
+                await self._store.mark_precip_state(umo, lid, new_state)
+                return
         if new_state != state:
             await self._store.mark_precip_state(umo, lid, new_state)
 

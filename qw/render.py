@@ -161,7 +161,11 @@ def block_daily(days: list[dict[str, Any]], limit: int = 4) -> str:
     lines: list[str] = []
     labels = ["今天", "明天", "后天"]
     for idx, day in enumerate(days[:limit]):
-        label = labels[idx] if idx < len(labels) else str(day.get("date") or "")[5:]
+        if idx < len(labels):
+            label = labels[idx]
+        else:
+            # 第 4 天起只用「11-02」读者算不清是周几，补上星期
+            label = _date_label(str(day.get("date") or ""))
         text = day.get("text_day") or ""
         if day.get("text_night") and day.get("text_night") != text:
             text = f"{text}转{day['text_night']}"
@@ -173,15 +177,58 @@ def block_daily(days: list[dict[str, Any]], limit: int = 4) -> str:
     return "\n".join(lines)
 
 
-def block_hourly(hours: list[dict[str, Any]], limit: int = 8) -> str:
+def _date_label(raw: str) -> str:
+    """``2026-11-02`` → ``11-02 周一``；解析不了就原样截取。"""
+    try:
+        day = datetime.strptime(raw[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return raw[5:10] if len(raw) >= 10 else raw
+    week = ("周日", "周一", "周二", "周三", "周四", "周五", "周六")[day.isoweekday() % 7]
+    return f"{day.month:02d}-{day.day:02d} {week}"
+
+
+def wrap(text: str, width: int, max_lines: int = 4) -> list[str]:
+    """按字数折行，尽量在标点后断开。
+
+    QQ / 微信的聊天窗口宽度不定，一行 120 字的预警正文在手机上要横向读，很难受。
+    这里按字宽折，标点处优先断，最多 ``max_lines`` 行，超出用省略号收尾。
+    断行处**保留标点**——把「、」吃掉会让「南港海域、天津港锚地海域」读成两个割裂的
+    地名，预警正文尤其不能这么干。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    if len(raw) <= width:
+        return [raw]
+    lines: list[str] = []
+    rest = raw
+    while rest and len(lines) < max_lines:
+        if len(rest) <= width:
+            lines.append(rest)
+            rest = ""
+            break
+        window = rest[:width]
+        cut = max(window.rfind(p) for p in "，。；！？、：")
+        if cut < width * 0.5:  # 标点太靠前就硬切，免得每行太短
+            cut = width - 1
+        lines.append(rest[: cut + 1])
+        rest = rest[cut + 1 :].lstrip()
+    if rest and lines:
+        lines[-1] = lines[-1][: width - 1] + "…"
+    return lines
+
+
+def block_hourly(hours: list[dict[str, Any]], limit: int = 8, per_line: int = 4) -> str:
+    """逐时预报。一条一行太宽，按每行 4 个折开。"""
     if not hours:
         return ""
-    parts: list[str] = []
+    cells: list[str] = []
     for item in hours[:limit]:
         time = item.get("time") or ""
         text = item.get("text") or ""
-        parts.append(f"{time} {_temp(item.get('temp'))}{text}")
-    return "逐时：" + "｜".join(parts)
+        cells.append(f"{time} {_temp(item.get('temp'))} {text}")
+    rows = ["　".join(cells[i : i + per_line]) for i in range(0, len(cells), per_line)]
+    return "逐时：" + "\n　　　".join(rows)
 
 
 def block_sun(day: dict[str, Any] | None) -> str:
@@ -201,11 +248,15 @@ def block_air(air: dict[str, Any] | None) -> str:
 
 
 def block_indices(items: list[dict[str, Any]], keep: tuple[str, ...] = ("1", "2", "3", "5")) -> str:
+    """生活指数。一行两条，最多 6 条——16 项全铺出来没人看。"""
     if not items:
         return ""
     picked = [i for i in items if i.get("type") in keep] or items[:4]
-    parts = [f"{i.get('name')} {i.get('category')}" for i in picked if i.get("name")]
-    return "指数：" + "｜".join(parts) if parts else ""
+    cells = [f"{i.get('name')} {i.get('category')}" for i in picked if i.get("name")][:6]
+    if not cells:
+        return ""
+    rows = ["｜".join(cells[i : i + 2]) for i in range(0, len(cells), 2)]
+    return "指数：" + "\n　　　".join(rows)
 
 
 def block_minutely(data: dict[str, Any] | None) -> str:
@@ -216,13 +267,29 @@ def block_minutely(data: dict[str, Any] | None) -> str:
 
 
 def block_alerts(alerts: list[dict[str, Any]]) -> str:
+    """生效预警。标题一行、发布信息一行、正文折行，最多 3 条。
+
+    以前把正文硬截 120 字塞在一行里，手机上要横向拖着读，等于没有。折行之后同样的
+    信息量读起来快得多。
+    """
     if not alerts:
         return ""
-    lines = ["⚠️ 生效预警："]
+    lines = [f"⚠️ 生效预警（{len(alerts)} 条）"]
     for alert in alerts[:3]:
-        lines.append(f"· {alert.get('title') or alert.get('type_name') or '预警'}")
-        if alert.get("text"):
-            lines.append(f"  {alert['text'][:120]}")
+        title = alert.get("title") or alert.get("type_name") or "预警"
+        lines.append(f"· {title}")
+        meta: list[str] = []
+        if alert.get("sender"):
+            meta.append(f"发布：{alert['sender']}")
+        if alert.get("start"):
+            stamp = f"{alert['start']}"
+            if alert.get("end"):
+                stamp += f" → {alert['end']}"
+            meta.append(stamp)
+        if meta:
+            lines.append("　" + "　".join(meta))
+        for row in wrap(alert.get("text") or "", 34, 4):
+            lines.append(f"　{row}")
     return "\n".join(lines)
 
 
