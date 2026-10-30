@@ -65,7 +65,7 @@ def address_help() -> str:
     return f"""地址指令：一个会话可以有多个地址，每个地址的推送方案各自独立。
 {cmd("地址")}　　　　　　　　　 列出所有地址
 {cmd("地址 加 天津")}　　　　　 添加地址（城市名，最多到区县）
-{cmd("地址 加 117.21,39.13")}　 添加地址（坐标，精度约 1 km）
+{cmd("地址 加 39.13,117.21")}　 添加地址（坐标，精度约 1 km）
 {cmd("地址 加 天津 名称=公司")}　带别名，方便区分
 {cmd("地址 用 2")}　　　　　　　切换当前地址（也可以写别名）
 {cmd("地址 改 2 名称=家")}　　　 改别名
@@ -358,7 +358,7 @@ class Commands:
         place_text = join_place(positional)
         if not place_text:
             return (
-                f"用法：{cmd('地址 加 天津')}　或　{cmd('地址 加 117.21,39.13')}"
+                f"用法：{cmd('地址 加 天津')}　或　{cmd('地址 加 39.13,117.21')}"
                 f"　或　{cmd('地址 加 天津 名称=公司')}"
             )
         if len(await self._store.locations(umo)) >= MAX_LOCATIONS:

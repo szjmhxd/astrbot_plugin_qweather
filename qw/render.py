@@ -75,8 +75,8 @@ def place_label(place: dict[str, Any]) -> str:
             lon = float(place.get("lon") or 0)
         except (TypeError, ValueError):
             return label
-        # 经度在前，和用户输入顺序一致，否则用户会以为保存的坐标被改了
-        label += f"（{lon:.2f},{lat:.2f}）"
+        # 纬度在前，和用户输入顺序一致，否则用户会以为保存的坐标被改了
+        label += f"（{lat:.2f},{lon:.2f}）"
     return label
 
 
@@ -93,7 +93,7 @@ def short_label(place: dict[str, Any]) -> str:
         lon = float(place.get("lon") or 0)
     except (TypeError, ValueError):
         return name
-    return f"{name}({lon:.2f},{lat:.2f})"
+    return f"{name}({lat:.2f},{lon:.2f})"
 
 
 def loc_label(loc: dict[str, Any]) -> str:

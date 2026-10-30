@@ -125,7 +125,7 @@ def _dms_atoms(text: str) -> list[float]:
 
 
 def _plain_atom(text: str) -> float | None:
-    """``"117.21"`` / ``"39.23N"`` / ``"E117.21"`` → float；带方位词时按方位定符号。"""
+    """``"39.13"`` / ``"39.23N"`` / ``"E117.21"`` → float；带方位词时按方位定符号。"""
     raw = (text or "").strip()
     if not raw:
         return None
@@ -140,10 +140,10 @@ def _plain_atom(text: str) -> float | None:
 
 
 def _number_pair(text: str) -> tuple[float, float] | None:
-    """把``"117.21,39.13"`` 或 ``"117°8'2\",39°13'53\""`` 拆成两个 float。
+    """把``"39.13,117.21"`` 或 ``"39°13'53\",117°8'2\""`` 拆成两个 float。
 
     度分秒只要出现过一次，就走度分秒解析（两个点都得写符号）；一个都没出现才按
-    普通数字切。混着写（``117°8'2",39.13``）也支持——先取到几个度分秒块，剩下一段
+    普通数字切。混着写（``39°13'53",117.21``）也支持——先取到几个度分秒块，剩下一段
     按裸数字解析。
     """
     if not text:
@@ -191,10 +191,12 @@ def looks_like_coord(text: str) -> bool:
 def parse_latlon(text: str) -> tuple[float, float] | None:
     """解析坐标，返回 ``(lat, lon)``；不是合法坐标就返回 ``None``。
 
-    顺序**固定为「经度,纬度」**，与和风 API 的 ``location`` 参数一致，也和国际通用写法
-    一致（GeoJSON、Google Maps 都是 lon,lat）。不做自动判序：自动判序看起来聪明，实际
-    会在经度 < 90 的地方（例如乌鲁木齐 87.62）猜错，而且用户永远不知道该按哪个顺序写。
-    写反了会有明确报错，见 :func:`coord_error`。
+    顺序**固定为「纬度,经度」**（地球坐标的通行读法，也是「39°13'53",117°8'2"」这种
+    从地图上抄下来的写法）。不做自动判序：自动判序看起来聪明，实际会在经度 < 90 的地方
+    （例如乌鲁木齐 87.62）猜错，而且用户永远不知道该按哪个顺序写。写反了会有明确报错，
+    见 :func:`coord_error`。
+
+    发给和风 API 时再翻成它要的 ``经度,纬度``，见 :func:`geo_location`。
 
     小数位截到 2 位：和风文档要求最多两位，且 0.01° ≈ 1.1 km，与后端网格分辨率相当，
     再多位没有实际意义。
@@ -202,8 +204,8 @@ def parse_latlon(text: str) -> tuple[float, float] | None:
     pair = _number_pair(text)
     if pair is None:
         return None
-    lon, lat = pair
-    if not (-180.0 <= lon <= 180.0) or not (-90.0 <= lat <= 90.0):
+    lat, lon = pair
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
         return None
     return round(lat, COORD_DECIMALS), round(lon, COORD_DECIMALS)
 
@@ -214,24 +216,25 @@ def coord_error(text: str) -> str:
     if pair is None:
         if _dms_atoms(text) and len(list(_DMS.finditer(text))) != 2:
             return (
-                "度分秒要两个点都写符号，例如 117°8'2\",39°13'53\"（经度在前）。\n"
+                "度分秒要两个点都写符号，例如 39°13'53\",117°8'2\"（纬度在前）。\n"
                 "只有度分秒、没有 ° 和 ' 的数字串分不开哪个是哪个。"
             )
-        return "坐标格式是「经度,纬度」，例如 117.21,39.13（天津）。"
-    lon, lat = pair
-    head = "坐标顺序是「经度,纬度」——经度在前，纬度在后。"
+        return "坐标格式是「纬度,经度」，例如 39.13,117.21（天津）。"
+    lat, lon = pair
+    head = "坐标顺序是「纬度,经度」——纬度在前，经度在后。"
     if abs(lat) > 90 >= abs(lon):
         raw = [m.group(0).strip() for m in _DMS.finditer(text)]
-        fixed = f"{raw[1]},{raw[0]}" if len(raw) == 2 else f"{lat:g},{lon:g}"
+        fixed = f"{raw[1]},{raw[0]}" if len(raw) == 2 else f"{lon:g},{lat:g}"
         return (
-            f"{head}\n你写的是「纬度,经度」，纬度 117° 那种值超不过 ±90 的只有经度。\n改成：{fixed}"
+            f"{head}\n你写的是「经度,纬度」，第一个数 {lat:g} 超过 ±90，那只能是经度。"
+            f"\n改成：{fixed}"
         )
-    return f"{head}\n经度范围 ±180、纬度范围 ±90，你写的是 {lon:g},{lat:g}。"
+    return f"{head}\n纬度范围 ±90、经度范围 ±180，你写的是 {lat:g},{lon:g}。"
 
 
 def format_coord(lat: float, lon: float) -> str:
-    """``(lat, lon)`` → ``"117.21,39.13"``（经度在前，与输入顺序一致）。"""
-    return f"{lon:.{COORD_DECIMALS}f},{lat:.{COORD_DECIMALS}f}"
+    """``(lat, lon)`` → ``"39.13,117.21"``（纬度在前，与输入顺序一致）。"""
+    return f"{lat:.{COORD_DECIMALS}f},{lon:.{COORD_DECIMALS}f}"
 
 
 def geo_location(lat: float, lon: float) -> str:

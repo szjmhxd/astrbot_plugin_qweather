@@ -560,58 +560,58 @@ def test_location() -> None:
 
 
 def test_coord() -> None:
-    section("坐标解析：固定 经度,纬度")
-    check("经度在前", parse_latlon("117.21,39.13") == (39.13, 117.21))
-    check("中文逗号", parse_latlon("117.21，39.13") == (39.13, 117.21))
-    check("空格分隔", parse_latlon("117.21 39.13") == (39.13, 117.21))
-    check("多余空格", parse_latlon("  117.21 ,  39.13 ") == (39.13, 117.21))
-    check("西部经度照写不猜", parse_latlon("87.62,43.82") == (43.82, 87.62))
-    check("南半球负纬度", parse_latlon("151.21,-33.87") == (-33.87, 151.21))
-    check("小数位截到 2 位", parse_latlon("117.21999,39.12345") == (39.12, 117.22))
+    section("坐标解析：固定 纬度,经度")
+    check("纬度在前", parse_latlon("39.13,117.21") == (39.13, 117.21))
+    check("中文逗号", parse_latlon("39.13，117.21") == (39.13, 117.21))
+    check("空格分隔", parse_latlon("39.13 117.21") == (39.13, 117.21))
+    check("多余空格", parse_latlon("  39.13 ,  117.21 ") == (39.13, 117.21))
+    check("西部经度照写不猜", parse_latlon("43.82,87.62") == (43.82, 87.62))
+    check("南半球负纬度", parse_latlon("-33.87,151.21") == (-33.87, 151.21))
+    check("小数位截到 2 位", parse_latlon("39.12345,117.21999") == (39.12, 117.22))
     check("城市名不是坐标", parse_latlon("杭州") is None)
     check("单个数字不是坐标", parse_latlon("117.21") is None)
-    check("三个数字不是坐标", parse_latlon("117.21,39.13,5") is None)
-    check("写反了：纬度超 90 → 拒绝", parse_latlon("39.13,117.21") is None)
-    check("经度超范围 → 拒绝", parse_latlon("200.0,39.13") is None)
+    check("三个数字不是坐标", parse_latlon("39.13,117.21,5") is None)
+    check("写反了：纬度超 90 → 拒绝", parse_latlon("117.21,39.13") is None)
+    check("经度超范围 → 拒绝", parse_latlon("39.13,200.0") is None)
     check("空串", parse_latlon("") is None)
 
     section("坐标写错的提示")
-    hint = coord_error("39.13,117.21")
-    check("指出是顺序问题", "经度,纬度" in hint)
-    check("给出可直接照抄的正确写法", "117.21,39.13" in hint, hint)
-    check("完全不是数字时给格式示例", "117.21,39.13" in coord_error("天津"))
+    hint = coord_error("117.21,39.13")
+    check("指出是顺序问题", "纬度,经度" in hint, hint)
+    check("给出可直接照抄的正确写法", "39.13,117.21" in hint, hint)
+    check("完全不是数字时给格式示例", "39.13,117.21" in coord_error("天津"))
 
     section("坐标形态判断")
     check("两个数字算坐标形态", looks_like_coord("39.13,117.21"))
     check("写反了也算坐标形态（好报错）", looks_like_coord("95.0,200.0"))
     check("城市名不是坐标形态", not looks_like_coord("天津"))
 
-    # 输出格式：输入、展示、请求三处统一「经度,纬度」
-    check("format_coord 经度在前", format_coord(39.13, 117.21) == "117.21,39.13")
+    # 输入、展示用「纬度,经度」；只有请求和风时才翻成「经度,纬度」
+    check("format_coord 纬度在前", format_coord(39.13, 117.21) == "39.13,117.21")
     check("geo_location 给和风", geo_location(39.13, 117.21) == "117.21,39.13")
 
     section("坐标：度分秒写法")
-    # 117°8'2" = 117 + 8/60 + 2/3600 = 117.1339 → 截两位 117.13
     # 39°13'53" = 39 + 13/60 + 53/3600 = 39.2314 → 截两位 39.23
-    dms = "117°8'2\",39°13'53\""
+    # 117°8'2" = 117 + 8/60 + 2/3600 = 117.1339 → 截两位 117.13
+    dms = "39°13'53\",117°8'2\""
     check("度分秒：标准写法", parse_latlon(dms) == (39.23, 117.13), str(parse_latlon(dms)))
-    check("度分秒：单引号当秒", parse_latlon("117°8'2',39°13'53''") == (39.23, 117.13))
-    check("度分秒：中文单位", parse_latlon("117度8分2秒,39度13分53秒") == (39.23, 117.13))
-    check("度分秒：全角撇号", parse_latlon("117°8′2″,39°13′53″") == (39.23, 117.13))
-    check("度分秒：只有度分", parse_latlon("117°8',39°13'") == (39.22, 117.13))
-    check("度分秒：和十进制混写", parse_latlon("117°8'2\",39.23") == (39.23, 117.13))
-    check("度分秒：空格分隔两个点", parse_latlon("117°8'2\" 39°13'53\"") == (39.23, 117.13))
-    check("度分秒：纬度在前要拒绝", parse_latlon("39°13'53\",117°8'2\"") is None)
-    check("度分秒：分钟超 60 不算坐标", parse_latlon("117°88'0\",39°13'0\"") is None)
+    check("度分秒：单引号当秒", parse_latlon("39°13'53',117°8'2'") == (39.23, 117.13))
+    check("度分秒：中文单位", parse_latlon("39度13分53秒,117度8分2秒") == (39.23, 117.13))
+    check("度分秒：全角撇号", parse_latlon("39°13′53″,117°8′2″") == (39.23, 117.13))
+    check("度分秒：只有度分", parse_latlon("39°13',117°8'") == (39.22, 117.13))
+    check("度分秒：和十进制混写", parse_latlon("39°13'53\",117.13") == (39.23, 117.13))
+    check("度分秒：空格分隔两个点", parse_latlon("39°13'53\" 117°8'2\"") == (39.23, 117.13))
+    check("度分秒：经度在前要拒绝", parse_latlon("117°8'2\",39°13'53\"") is None)
+    check("度分秒：分钟超 60 不算坐标", parse_latlon("39°88'0\",117°13'0\"") is None)
     check(
         "度分秒：写反了给出可复制的正确写法",
-        "117°8'2\",39°13'53\"" in coord_error("39°13'53\",117°8'2\""),
-        coord_error("39°13'53\",117°8'2\""),
+        "39°13'53\",117°8'2\"" in coord_error("117°8'2\",39°13'53\""),
+        coord_error("117°8'2\",39°13'53\""),
     )
-    check("方位词：后缀", parse_latlon("117.13E,39.23N") == (39.23, 117.13))
-    check("方位词：前缀", parse_latlon("E117.13,N39.23") == (39.23, 117.13))
-    check("方位词：S 为负", parse_latlon("151.21E,33.87S") == (-33.87, 151.21))
-    check("裸数字串分不开就拒绝", parse_latlon("117 8 2, 39 13 53") is None)
+    check("方位词：后缀", parse_latlon("39.23N,117.13E") == (39.23, 117.13))
+    check("方位词：前缀", parse_latlon("N39.23,E117.13") == (39.23, 117.13))
+    check("方位词：S 为负", parse_latlon("33.87S,151.21E") == (-33.87, 151.21))
+    check("裸数字串分不开就拒绝", parse_latlon("39 13 53, 117 8 2") is None)
 
     section("地点标签")
     city = {"name": "杭州", "adm1": "浙江省", "adm2": "杭州"}
@@ -626,8 +626,8 @@ def test_coord() -> None:
         "lat": 39.13,
         "lon": 117.21,
     }
-    check("坐标带坐标后缀", place_label(coord) == "天津市·和平（117.21,39.13）", place_label(coord))
-    check("推送短名带坐标", short_label(coord) == "和平(117.21,39.13)", short_label(coord))
+    check("坐标带坐标后缀", place_label(coord) == "天津市·和平（39.13,117.21）", place_label(coord))
+    check("推送短名带坐标", short_label(coord) == "和平(39.13,117.21)", short_label(coord))
     check("推送短名不带省", short_label(district) == "武清", short_label(district))
 
     section("地址别名")
