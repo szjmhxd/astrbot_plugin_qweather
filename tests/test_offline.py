@@ -81,8 +81,11 @@ def install_stubs() -> None:
 
     class Star:
         def __init__(self, context=None, config=None):
+            # 和 AstrBot v4.29 一致：基类只存 context，**不存 config**。
+            # 之前这里贴心地写成了 self.config = config，正好把「插件忘了自己留一份配置」
+            # 的 bug 盖住了，线上表现为「面板里填了 key，插件一直说没配」。
             self.context = context
-            self.config = config or {}
+            del config
 
     class Context:
         async def send_message(self, *a, **k):
@@ -1373,7 +1376,58 @@ def test_config_reload() -> None:
             "接口错误仍带状态码",
             str(QWeatherError(401, "Unauthorized", "bad signature")).startswith("401 "),
         )
+
+        # 真实框架（v4.29）的 Star 不存 config，插件必须自己留一份，否则所有配置项都
+        # 退化成默认值。这里直接断言插件手里确实握着那份配置。
+        section("配置热更新：插件自己留住了配置")
+        check("插件自己存了 config", getattr(plugin, "config", None) is plugin._conf)
+        check(
+            "构造时就读到传入的值",
+            plugin._conf["command_prefix"] == "qw" and "iss" in plugin._conf,
+            str(plugin._conf)[:60],
+        )
+
+        section("配置热更新：框架不给路径时按目录反推")
+        root = tmp / "data"
+        data_dir = root / "plugin_data" / "astrbot_plugin_qweather"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        cfg_dir = root / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        guess = cfg_dir / "astrbot_plugin_qweather_config.json"
+        guess.write_text(json.dumps(payload), encoding="utf-8")
+
+        bare = QWeatherPlugin(None, dict(payload))  # 普通 dict，没有 config_path
+        bare._data_dir = data_dir
+        bare._cfg_file = None
+        check("反推到 data/config 下的同名文件", bare._config_path == str(guess), bare._config_path)
+        check("首次读取只是记下时间戳", bare._cfg_str("iss") == "", bare._cfg_str("iss"))
+
+        payload["iss"] = "Q9FALLBACK"
+        guess.write_text(json.dumps(payload), encoding="utf-8")
+        stamp += 10**9
+        os.utime(guess, ns=(stamp, stamp))
+        check("按反推路径也能热更新", bare._cfg_str("iss") == "Q9FALLBACK", bare._cfg_str("iss"))
+
+        section("配置热更新：路径彻底找不到时不崩")
+        lost = QWeatherPlugin(None, {})
+        lost._data_dir = tmp / "nowhere" / "plugin_data" / "x"
+        lost._cfg_file = None
+        check("没有配置文件路径就返回空串", lost._config_path == "", lost._config_path)
+        check("照样能读默认值", lost._cfg_bool("enabled", True) is True)
+
+        section("配置热更新：前缀改了就换")
+        from astrbot_plugin_qweather.qw import naming
+
+        payload["command_prefix"] = "wxtest"
+        cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+        stamp += 10**9
+        os.utime(cfg_path, ns=(stamp, stamp))
+        check("插件实例的前缀跟着换", plugin._cfg_str("command_prefix") == "wxtest")
+        check("实例前缀已更新", plugin._prefix == "wxtest", plugin._prefix)
+        check("按新前缀能路由", naming.split("/wxtest 天气")[0] is True)
+        check("老前缀不再接管", naming.split("/qweather 天气")[0] is False)
     finally:
+        naming.set_prefix("qweather")  # 前缀是全局的，别污染后面的用例
         shutil.rmtree(tmp, ignore_errors=True)
 
 

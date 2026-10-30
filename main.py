@@ -171,9 +171,21 @@ def help_text() -> str:
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context, config)
+        # AstrBot v4.29 的 Star.__init__ 不再把 config 存成 self.config，插件得自己留一份。
+        # 以前漏了这步，self.config 直接抛 AttributeError，被 _raw 的兜底吃掉，所有配置项
+        # 都退化成默认值——表现就是「面板里明明填了 key，插件一直说没配」。
+        # 这里以 _conf 为准（同时补上 self.config，兼容仍会自己赋值的老版本框架）。
+        self._conf: dict = config if isinstance(config, dict) else {}
+        try:
+            self.config = self._conf  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001 框架把 config 定义成只读属性时不影响主流程
+            pass
         # 配置文件的 mtime，用来发现「WebUI 保存了但插件没重载」
         self._cfg_mtime: int = -1
+        # 配置文件路径，第一次用到时再猜（框架给不出时按数据目录反推）
+        self._cfg_file: str | None = None
         data_dir = self._resolve_data_dir()
+        self._data_dir = data_dir
 
         # 前缀必须非空：空前缀等于允许「/天气」这种裸指令，会和别的插件撞名
         self._prefix = naming.set_prefix(self._cfg_str("command_prefix"))
@@ -245,8 +257,16 @@ class QWeatherPlugin(Star):
             f"系统默认 key {key_state}；指令前缀 /{self._prefix}；"
             f"{today.year} 年工作日数据 {calendar_state}"
         )
-        cfg_path = self._config_path or "（框架未提供配置文件路径）"
-        logger.info(f"[和风天气] 配置文件：{cfg_path}")
+        cfg_path = self._config_path
+        if cfg_path:
+            logger.info(f"[和风天气] 配置文件：{cfg_path}")
+        else:
+            cfg_dir = self._data_dir.parent.parent / "config"
+            logger.info(
+                f"[和风天气] 配置文件：没定位到（找不到 {cfg_dir} 下的 "
+                f"{PLUGIN_NAME}_config.json，改配置后需要手动重载插件）"
+            )
+        logger.info(f"[和风天气] 配置读到 {len(self._conf)} 项")
         for line in self._keys.default_fingerprint():
             logger.info(f"[和风天气] 配置项 {line}")
         if not self._keys.default_ready:
@@ -694,11 +714,28 @@ class QWeatherPlugin(Star):
 
     @property
     def _config_path(self) -> str:
-        """插件配置文件的落盘路径（拿不到就空串）。"""
+        """插件配置文件的落盘路径（找不到就空串）。
+
+        框架给的 ``AstrBotConfig`` 带 ``config_path``，直接用；万一拿不到（配置对象是被
+        替换成普通 dict 的场合），按数据目录反推：数据目录是 ``data/plugin_data/<插件名>``，
+        配置文件在同级的 ``data/config/<插件名>_config.json``。
+        """
+        if self._cfg_file is not None:
+            return self._cfg_file
+        path = ""
         try:
-            return str(getattr(self.config, "config_path", "") or "")
-        except Exception:  # noqa: BLE001
-            return ""
+            path = str(getattr(self._conf, "config_path", "") or "")
+        except Exception:  # noqa: BLE001 配置对象奇形怪状时按没有处理
+            path = ""
+        if not path:
+            try:
+                guess = self._data_dir.parent.parent / "config" / f"{PLUGIN_NAME}_config.json"
+                if guess.is_file():
+                    path = str(guess)
+            except Exception:  # noqa: BLE001
+                path = ""
+        self._cfg_file = path
+        return path
 
     def _sync_config(self) -> None:
         """WebUI 保存配置不会重载插件，这里按文件 mtime 自动重读一次。
@@ -728,7 +765,7 @@ class QWeatherPlugin(Star):
         if not isinstance(data, dict):
             return
         try:
-            self.config.update(data)
+            self._conf.update(data)
         except Exception:  # noqa: BLE001 配置对象只读时放弃热更新，不影响主流程
             return
         keys = getattr(self, "_keys", None)
@@ -741,11 +778,17 @@ class QWeatherPlugin(Star):
                 pem=str(data.get("private_key") or ""),
             )
             logger.info(f"[和风天气] 配置已保存，自动重读：系统默认 key {keys.default_state()}")
+        # 前缀是构造时定死的，不跟着换会让用户以为「改了没用」
+        new_prefix = naming.set_prefix(str(data.get("command_prefix") or ""))
+        old_prefix = getattr(self, "_prefix", None)
+        if old_prefix is not None and new_prefix != old_prefix:
+            logger.info(f"[和风天气] 指令前缀 {old_prefix} → {new_prefix}")
+            self._prefix = new_prefix
 
     def _raw(self, key: str, default: Any = None) -> Any:
         self._sync_config()
         try:
-            value = self.config.get(key, default)
+            value = self._conf.get(key, default)
         except Exception:  # noqa: BLE001
             return default
         return default if value is None else value
