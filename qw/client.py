@@ -40,6 +40,11 @@ class QWeatherError(Exception):
         self.detail = detail
         super().__init__(f"{status} {title}{('：' + detail) if detail else ''}")
 
+    def __str__(self) -> str:
+        """status 0 是插件本地的错误（比如没配 key），前面那个 0 对用户没意义。"""
+        head = self.title if self.status == 0 else f"{self.status} {self.title}"
+        return f"{head}{('：' + self.detail) if self.detail else ''}"
+
     @property
     def is_auth(self) -> bool:
         return self.status == 401

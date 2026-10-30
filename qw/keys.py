@@ -50,6 +50,24 @@ WIZARD_STEPS: list[tuple[str, str]] = [
 
 STEP_KEYS = [s[0] for s in WIZARD_STEPS]
 
+# 指纹要展示的字段顺序：(给人看的名字, 内部键)
+_FINGERPRINT_FIELDS = [
+    ("iss", "iss"),
+    ("sub", "sub"),
+    ("kid", "kid"),
+    ("host", "host"),
+]
+
+
+def _mask(value: str, keep: int = 4) -> str:
+    """打码成「前 4 位…（长度）」，够对照是哪一项，又不至于把凭据贴进聊天记录。"""
+    text = (value or "").strip()
+    if not text:
+        return "空"
+    if len(text) <= keep:
+        return f"{'*' * len(text)}（{len(text)} 位）"
+    return f"{text[:keep]}…（{len(text)} 位）"
+
 
 @dataclass(slots=True)
 class ResolvedKey:
@@ -74,22 +92,47 @@ class KeyStore:
         self._lock = asyncio.Lock()
         self._data: dict[str, dict[str, Any]] = {}
         self._loaded = False
-        self._default_raw = {
-            "iss": (default_iss or "").strip(),
-            "sub": (default_sub or "").strip(),
-            "kid": (default_kid or "").strip(),
-            "host": (default_host or "").strip(),
-            "pem": (default_pem or "").strip(),
-        }
+        self._default_raw: dict[str, str] = {}
         self._default_seed: bytes | None = None
         self._default_error = ""
-        if self._default_raw["pem"]:
-            try:
-                self._default_seed = seed_from_pem(self._default_raw["pem"])
-            except ValueError as exc:
-                self._default_error = str(exc)
+        self.set_defaults(default_iss, default_sub, default_kid, default_host, default_pem)
 
     # ---------------------------------------------------------------- 默认 key
+
+    def set_defaults(
+        self,
+        iss: str = "",
+        sub: str = "",
+        kid: str = "",
+        host: str = "",
+        pem: str = "",
+    ) -> bool:
+        """换一套系统默认 key（WebUI 保存配置后热更新用），返回是否有变化。
+
+        私钥要重新解析：解析失败只记错误，不抛异常，免得一条坏配置把插件带崩。
+        """
+        raw = {
+            "iss": (iss or "").strip(),
+            "sub": (sub or "").strip(),
+            "kid": (kid or "").strip(),
+            "host": (host or "").strip(),
+            "pem": (pem or "").strip(),
+        }
+        if raw == self._default_raw:
+            return False
+        self._default_raw = raw
+        self._default_seed = None
+        self._default_error = ""
+        if raw["pem"]:
+            try:
+                self._default_seed = seed_from_pem(raw["pem"])
+            except ValueError as exc:
+                self._default_error = str(exc)
+        return True
+
+    def default_state(self) -> str:
+        """一句话状态，日志和报错共用。"""
+        return "就绪" if self.default_ready else self.default_error
 
     @property
     def default_ready(self) -> bool:
@@ -100,19 +143,25 @@ class KeyStore:
     def default_error(self) -> str:
         if self._default_error:
             return self._default_error
-        missing = [k for k in ("iss", "sub", "kid", "host") if not self._default_raw[k]]
-        if not self._default_raw["pem"]:
+        missing = [k for k in ("iss", "sub", "kid", "host") if not self._default_raw.get(k)]
+        if not self._default_raw.get("pem"):
             missing.append("私钥")
         return f"系统默认 key 缺少：{', '.join(missing)}" if missing else ""
 
+    def default_fingerprint(self) -> list[str]:
+        """打码后的各项指纹，用来核对「插件到底读到了什么」。"""
+        raw = self._default_raw
+        lines = [f"{name}={_mask(raw.get(key, ''))}" for name, key in _FINGERPRINT_FIELDS]
+        if self._default_error:
+            lines.append(f"私钥=解析失败（{self._default_error}）")
+        elif self._default_seed:
+            lines.append(f"私钥=已载入（公钥 {self.default_public_key()[:8]}…）")
+        else:
+            lines.append("私钥=空")
+        return lines
+
     def default_public_key(self) -> str:
         return public_key_b64(self._default_seed) if self._default_seed else ""
-
-    def default_preview(self) -> str:
-        raw = self._default_raw
-        if not self.default_ready:
-            return f"未配置（{self.default_error}）"
-        return f"{raw['iss']} / {raw['sub']} / {raw['kid']} @ {raw['host']}"
 
     # ---------------------------------------------------------------- 持久化
 
@@ -226,13 +275,18 @@ class KeyStore:
         else:
             lines.append("本会话：使用系统默认 key")
         lines.append("")
-        lines.append(f"系统默认：{self.default_preview()}")
+        lines.append("系统默认：" + ("已就绪" if self.default_ready else "未配置"))
+        for item in self.default_fingerprint():
+            lines.append(f"  {item}")
         if self.default_ready:
             lines.append(f"系统公钥：{self.default_public_key()}")
         else:
+            lines.append(f"⚠️ {self.default_error}")
             lines.append(
-                f"⚠️ {self.default_error}，请在插件配置里填好，或本会话用「{cmd('key 设置')}」自带"
+                "  在 WebUI → 插件 → 本插件 → 配置里填好这几项，点「保存并关闭」就生效"
+                "（插件会自动重读，不用重载）"
             )
+            lines.append(f"  只让本会话用自己的 key：发「{cmd('key 设置')}」")
         return "\n".join(lines)
 
 

@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import sys
+import tempfile
+import time
 import types
 from datetime import date, datetime
 from pathlib import Path
@@ -1218,6 +1222,52 @@ def test_keys() -> None:
         resolved = await keys.resolve(umo)
         check("恢复默认", removed and resolved.source == "default")
 
+        # 热更新：WebUI 保存配置后不用重载，set_defaults 直接换掉默认 key
+        check(
+            "换一组相同的默认 key 不算变化",
+            keys.set_defaults("Q1", "SUB1", "KID1", "h.example.com", pem) is False,
+        )
+        check(
+            "换默认 key 会被识别",
+            keys.set_defaults("Q9", "SUB9", "KID9", "h9.example.com", pem) is True,
+        )
+        check("换完仍然就绪", keys.default_ready and keys.default_state() == "就绪")
+        check(
+            "清空默认 key 后报缺少项",
+            keys.set_defaults("", "", "", "", "") is True
+            and "iss" in keys.default_error
+            and "私钥" in keys.default_error,
+        )
+        check("清空后不再就绪", not keys.default_ready)
+        fingerprint = keys.default_fingerprint()
+        check(
+            "指纹逐项给出",
+            len(fingerprint) == 5 and fingerprint[0] == "iss=空",
+            str(fingerprint),
+        )
+        keys.set_defaults("Q9ABCDEFGH", "SUB1234567", "KID12345678", "ab.re.qweatherapi.com", pem)
+        masked = keys.default_fingerprint()
+        check(
+            "指纹只露前 4 位",
+            masked[0] == "iss=Q9AB…（10 位）" and "SUB1234567" not in " ".join(masked),
+            str(masked),
+        )
+        check("指纹标注私钥已载入", "已载入" in masked[4], masked[4])
+        check(
+            "坏私钥只记错误不抛异常",
+            keys.set_defaults(
+                "Q9",
+                "SUB9",
+                "KID9",
+                "h9",
+                "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----",
+            )
+            is True
+            and not keys.default_ready
+            and "解析" in keys.default_error,
+            keys.default_error,
+        )
+
         # 引导流程
         wizard = KeyWizard(timeout=60)
         prompt = wizard.start(umo)
@@ -1238,6 +1288,93 @@ def test_keys() -> None:
         check("取消后状态清除", (wizard.cancel(umo), wizard.get(umo) is None)[1])
 
     asyncio.run(run())
+
+
+def test_config_reload() -> None:
+    """WebUI 保存配置不会重载插件，插件得自己按文件 mtime 重读。"""
+    from astrbot_plugin_qweather.main import QWeatherPlugin
+    from astrbot_plugin_qweather.qw.client import QWeatherError
+
+    section("配置热更新：保存即生效")
+
+    pem = (
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MC4CAQAwBQYDK2VwBCIEIL7RbFsq4W6J+5sAlWZyL6lRieZN/+DXu+vn0vNjNzF8\n"
+        "-----END PRIVATE KEY-----"
+    )
+    tmp = Path(tempfile.mkdtemp(prefix="qwcfg_"))
+    cfg_path = tmp / "astrbot_plugin_qweather_config.json"
+    payload: dict = {
+        "iss": "",
+        "sub": "",
+        "kid": "",
+        "host": "",
+        "private_key": "",
+        "command_prefix": "qw",
+        "enabled": True,
+        "push_enabled": False,
+    }
+    cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    class _Cfg(dict):
+        # AstrBot 的配置对象带 config_path，热更新靠它定位文件
+        config_path = str(cfg_path)
+
+    try:
+        plugin = QWeatherPlugin(None, _Cfg(payload))
+        check("空配置时默认 key 未就绪", not plugin._keys.default_ready)
+        check("空配置时报缺少项", "iss" in plugin._keys.default_error)
+        try:
+            asyncio.run(plugin._client_for("test:FriendMessage:1"))
+        except QWeatherError as exc:
+            check("空配置时取客户端报缺 key", "没有可用的 key" in str(exc), str(exc))
+        else:
+            check("空配置时取客户端报缺 key", False, "居然拿到了客户端")
+
+        payload.update(
+            {
+                "iss": "Q9ABCDEFGH",
+                "sub": "3CTMP3UCG4",
+                "kid": "TDPPRGVSGQC",
+                "host": "ne6yvtne25.re.qweatherapi.com",
+                "private_key": pem,
+            }
+        )
+        cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+        stamp = time.time_ns() + 10**9  # 保证 mtime 一定变
+        os.utime(cfg_path, ns=(stamp, stamp))
+
+        check(
+            "保存后立刻读到新 iss",
+            plugin._cfg_str("iss") == "Q9ABCDEFGH",
+            plugin._cfg_str("iss"),
+        )
+        check("保存后默认 key 自动就绪", plugin._keys.default_ready, plugin._keys.default_error)
+        check("前缀也跟着热更新", plugin._cfg_str("command_prefix") == "qw")
+        check(
+            "保存后不用重载就能取到客户端",
+            asyncio.run(plugin._client_for("test:FriendMessage:1")) is not None,
+        )
+
+        payload["iss"] = ""
+        cfg_path.write_text(json.dumps(payload), encoding="utf-8")
+        stamp += 10**9
+        os.utime(cfg_path, ns=(stamp, stamp))
+        check(
+            "清空后再读就回落",
+            plugin._cfg_str("iss") == "" and not plugin._keys.default_ready,
+        )
+
+        check(
+            "本地错误不显示状态码 0",
+            str(QWeatherError(0, "没有可用的 key", "缺 iss")).startswith("没有可用的 key"),
+        )
+        check(
+            "接口错误仍带状态码",
+            str(QWeatherError(401, "Unauthorized", "bad signature")).startswith("401 "),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 7. 渲染
@@ -1742,6 +1879,7 @@ def main() -> int:
     test_usage_ledger()
     test_cost()
     test_keys()
+    test_config_reload()
     test_render()
     test_naming()
     test_plugin_class()

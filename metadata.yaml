@@ -2,7 +2,7 @@ name: astrbot_plugin_qweather
 display_name: 和风天气订阅推送
 desc: 基于和风天气 QWeather 的天气查询与主动推送，全部指令收在 /qweather 前缀下（前缀可配且不允许为空，避免和别的插件撞指令）。支持一个会话绑定多个地址且各自独立的推送方案、定时推送天气（每天 / 每周 / 每月 / 每小时 / 日出日落前后，可限定仅在工作日或休息日）、降水开始与结束提醒、灾害预警轮询推送（等级升降都提醒）、额度报告定时推送（含当天与前一天用量），并自带节假日与调休日历（自动抓取次年安排、逐年清理旧数据），坐标支持度分秒写法；一条命令导出全部设置并估出每月成本。全部配置在对话里完成，并支持每个会话使用自己的 API 凭据。
 short_desc: /qweather 指令族：多地址查询 + 定时推送 + 降水与灾害预警 + 额度推送 + 成本估算
-version: v1.5.1
+version: v1.5.2
 author: szjmhxd
 repo: https://github.com/szjmhxd/astrbot_plugin_qweather
 astrbot_version: ">=4.16,<5"

@@ -34,6 +34,8 @@ ProcessStage：LLM 只在 ``is_at_or_wake_command`` 为真且没有发送过消�
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -169,6 +171,8 @@ def help_text() -> str:
 class QWeatherPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context, config)
+        # 配置文件的 mtime，用来发现「WebUI 保存了但插件没重载」
+        self._cfg_mtime: int = -1
         data_dir = self._resolve_data_dir()
 
         # 前缀必须非空：空前缀等于允许「/天气」这种裸指令，会和别的插件撞名
@@ -241,6 +245,16 @@ class QWeatherPlugin(Star):
             f"系统默认 key {key_state}；指令前缀 /{self._prefix}；"
             f"{today.year} 年工作日数据 {calendar_state}"
         )
+        cfg_path = self._config_path or "（框架未提供配置文件路径）"
+        logger.info(f"[和风天气] 配置文件：{cfg_path}")
+        for line in self._keys.default_fingerprint():
+            logger.info(f"[和风天气] 配置项 {line}")
+        if not self._keys.default_ready:
+            logger.warning(
+                "[和风天气] 系统默认 key 还没配好。在 WebUI → 插件 → 本插件 → 配置里填 "
+                "iss/sub/kid/host/私钥，点「保存并关闭」即可，插件会自动重读，不用重载；"
+                "也可以让每个会话发「/qweather key 设置」用自己的 key。"
+            )
         if self._cfg_bool("push_enabled", True):
             self._pusher.start()
 
@@ -427,9 +441,17 @@ class QWeatherPlugin(Star):
 
     async def _client_for(self, umo: str) -> QWeatherClient:
         """按本会话解析出的凭据复用客户端（同一套 key 共用一个连接池与 JWT）。"""
+        self._sync_config()  # 先确认配置是最新的，否则 WebUI 刚填的 key 可能还用不上
         resolved = await self._keys.resolve(umo)
         if resolved is None:
-            raise QWeatherError(0, "没有可用的 key", self._keys.default_error or "请先配置系统 key")
+            raise QWeatherError(
+                0,
+                "没有可用的 key",
+                f"{self._keys.default_error or '请先配置系统 key'}\n"
+                "填法：WebUI → 插件 → 本插件 → 配置，填 iss/sub/kid/host/私钥，"
+                "点「保存并关闭」即可（插件会自动重读，不用重载）；"
+                f"也可以发 /{self._prefix} key 设置 用本会话自己的 key。",
+            )
         fingerprint = resolved.key.fingerprint()
         client = self._clients.get(fingerprint)
         if client is None:
@@ -670,7 +692,58 @@ class QWeatherPlugin(Star):
             logger.warning(f"[和风天气] 取不到数据目录（{exc}），回退到 {fallback}")
             return fallback
 
+    @property
+    def _config_path(self) -> str:
+        """插件配置文件的落盘路径（拿不到就空串）。"""
+        try:
+            return str(getattr(self.config, "config_path", "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _sync_config(self) -> None:
+        """WebUI 保存配置不会重载插件，这里按文件 mtime 自动重读一次。
+
+        AstrBot 的保存接口只写 ``data/config/<插件名>_config.json``，正在跑的这个实例仍
+        持有旧 dict，于是出现「面板里明明填了 key，插件却说没配」。每次读配置前 stat 一下
+        文件，mtime 变了就把新值合并进来，顺手刷新系统默认 key，省掉手动重载。
+        """
+        path = self._config_path
+        if not path:
+            return
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            return
+        if self._cfg_mtime < 0:  # 首次只是记下时间戳，值已经由框架加载好了
+            self._cfg_mtime = mtime
+            return
+        if mtime == self._cfg_mtime:
+            return
+        self._cfg_mtime = mtime
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            self.config.update(data)
+        except Exception:  # noqa: BLE001 配置对象只读时放弃热更新，不影响主流程
+            return
+        keys = getattr(self, "_keys", None)
+        if keys is not None:
+            keys.set_defaults(
+                iss=str(data.get("iss") or ""),
+                sub=str(data.get("sub") or ""),
+                kid=str(data.get("kid") or ""),
+                host=str(data.get("host") or ""),
+                pem=str(data.get("private_key") or ""),
+            )
+            logger.info(f"[和风天气] 配置已保存，自动重读：系统默认 key {keys.default_state()}")
+
     def _raw(self, key: str, default: Any = None) -> Any:
+        self._sync_config()
         try:
             value = self.config.get(key, default)
         except Exception:  # noqa: BLE001
