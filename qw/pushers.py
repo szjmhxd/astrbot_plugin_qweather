@@ -33,7 +33,8 @@ from astrbot.api import logger
 from . import quota, render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore
-from .store import SubStore, level_rank
+from .store import SubStore, level_rank, level_text
+from .usage import UsageLedger
 from .workday import WorkdayCalendar
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
@@ -92,12 +93,14 @@ class Pusher:
         client_factory: ClientFactory,
         send: Sender,
         calendar: WorkdayCalendar | None = None,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
         self._client = client_factory
         self._send = send
         self._calendar = calendar
+        self._ledger = ledger
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -223,7 +226,7 @@ class Pusher:
                 note = "本会话专用 key" if resolved.source == "session" else "系统默认 key"
         except Exception:  # noqa: BLE001 取不到就只是少一行说明
             note = ""
-        return await quota.build_report(client, key_note=note)
+        return await quota.build_report(client, key_note=note, ledger=self._ledger)
 
     # ---------------------------------------------------------------- 定时规则
 
@@ -371,7 +374,18 @@ class Pusher:
 
         min_level = cfg.get("min_level") or "yellow"
         allow_upgrade = bool(cfg.get("notify_on_upgrade", True))
+        allow_downgrade = bool(cfg.get("notify_on_downgrade", True))
         pushed = (loc.get("state") or {}).get("alerts") or {}
+
+        def level_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
+            """等级变了、且这个方向允许推，才算要再推一次。"""
+            before = level_rank(old.get("level"))
+            after = level_rank(new.get("level"))
+            if after > before:
+                return allow_upgrade
+            if after < before:
+                return allow_downgrade
+            return False
 
         for alert in alerts:
             if level_rank(alert.get("level")) < level_rank(min_level):
@@ -381,27 +395,16 @@ class Pusher:
                 continue
             previous = pushed.get(alert_id)
             if previous:
-                # 同一条已推过；只有等级升高才算需要再推
-                if not (
-                    allow_upgrade
-                    and level_rank(alert.get("level")) > level_rank(previous.get("level"))
-                ):
+                if not level_changed(previous, alert):
                     continue
             else:
                 # 可能是同一条预警的修订版（related 指向旧 id）
                 related = alert.get("related")
-                if (
-                    related
-                    and related in pushed
-                    and not (
-                        allow_upgrade
-                        and level_rank(alert.get("level"))
-                        > level_rank(pushed[related].get("level"))
-                    )
-                ):
-                    continue
+                if related and related in pushed:
+                    if not level_changed(pushed[related], alert):
+                        continue
 
-            text = self._alert_text(loc, alert)
+            text = self._alert_text(loc, alert, previous or pushed.get(alert.get("related") or ""))
             if await self._send(umo, text):
                 await self._store.remember_alert(
                     umo,
@@ -437,9 +440,24 @@ class Pusher:
         return self._warning_ids
 
     @staticmethod
-    def _alert_text(loc: dict[str, Any], alert: dict[str, Any]) -> str:
+    def _alert_text(
+        loc: dict[str, Any],
+        alert: dict[str, Any],
+        previous: dict[str, Any] | None = None,
+    ) -> str:
+        level = level_text(str(alert.get("level") or ""))
+        kind = alert.get("type_name") or ""
+        head = f"⚠️ 【{render.loc_short(loc)}】{level}{kind}预警"
+        # 等级变化时把「从哪到哪」写出来，否则用户看不出为什么又推一遍
+        if previous and level_rank(alert.get("level")) != level_rank(previous.get("level")):
+            arrow = (
+                "↑" if level_rank(alert.get("level")) > level_rank(previous.get("level")) else "↓"
+            )
+            before = level_text(str(previous.get("level") or ""))
+            after = level_text(str(alert.get("level") or ""))
+            head = f"{head}（{arrow} {before}→{after}）"
         lines = [
-            f"⚠️ 【{render.loc_short(loc)}】{alert.get('level')}{alert.get('type_name')}预警",
+            head,
             alert.get("title") or "",
             f"发布：{alert.get('sender') or '—'}　{alert.get('start')} 至 {alert.get('end')}",
         ]

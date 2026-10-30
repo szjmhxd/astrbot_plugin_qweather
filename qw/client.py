@@ -90,18 +90,97 @@ def _num(obj: Any) -> float | int | None:
 _COORD_SEP = re.compile(r"[,，;；/\\\s]+")
 COORD_DECIMALS = 2
 
+# 度分秒：``39°13'53"`` / ``39度13分53秒`` / ``117°8′2″`` 都认。
+# 关键点：只有在「度」带了单位（° 或 度）时才继续吃分和秒，否则 ``39 13 53 117 8 2``
+# 这种纯数字串会被贪婪地当成一个坐标，永远分不开两个点。
+_DMS = re.compile(
+    r"""
+    (?P<sign>[+-])?
+    (?P<deg>\d+(?:\.\d+)?)\s*(?:°|度|º)
+    (?:\s*(?P<min>\d+(?:\.\d+)?)\s*(?:['′’分]))?
+    (?:\s*(?P<sec>\d+(?:\.\d+)?)\s*["″“”秒']{1,2})?
+    """,
+    re.VERBOSE,
+)
+
+# 十进制的裸数字（可能带 N/S/E/W 方位词，前缀或后缀都行）
+_PLAIN = re.compile(r"^(?P<pre>[NSEWnsew])?\s*(?P<num>[+-]?\d+(?:\.\d+)?)\s*(?P<dir>[NSEWnsew])?$")
+
+
+def _dms_atoms(text: str) -> list[float]:
+    """把文本里所有「度分秒」块转成十进制度，按出现顺序返回。"""
+    out: list[float] = []
+    for match in _DMS.finditer(text or ""):
+        deg = float(match.group("deg"))
+        minutes = float(match.group("min") or 0)
+        seconds = float(match.group("sec") or 0)
+        # 分秒必须 < 60，否则大概率是写错了（例如把 61 分当成了分）
+        if minutes >= 60 or seconds >= 60:
+            return []
+        value = deg + minutes / 60 + seconds / 3600
+        if match.group("sign") == "-":
+            value = -value
+        out.append(value)
+    return out
+
+
+def _plain_atom(text: str) -> float | None:
+    """``"117.21"`` / ``"39.23N"`` / ``"E117.21"`` → float；带方位词时按方位定符号。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    match = _PLAIN.match(raw)
+    if match is None:
+        return None
+    value = float(match.group("num"))
+    direction = (match.group("dir") or match.group("pre") or "").upper()
+    if direction in ("S", "W") and value > 0:
+        value = -value
+    return value
+
 
 def _number_pair(text: str) -> tuple[float, float] | None:
-    """把 ``"117.21,39.13"`` 拆成两个 float；不是两个数就返回 None。"""
+    """把``"117.21,39.13"`` 或 ``"117°8'2\",39°13'53\""`` 拆成两个 float。
+
+    度分秒只要出现过一次，就走度分秒解析（两个点都得写符号）；一个都没出现才按
+    普通数字切。混着写（``117°8'2",39.13``）也支持——先取到几个度分秒块，剩下一段
+    按裸数字解析。
+    """
     if not text:
         return None
-    parts = [p for p in _COORD_SEP.split(text.strip()) if p]
+    raw = text.strip()
+
+    atoms = _dms_atoms(raw)
+    if atoms:
+        # 把每个度分秒块换成一个不含分隔符的占位符，再按原顺序分词，
+        # 这样「度分秒 + 裸数字」混着写也能各归各位。
+        masked = raw
+        pieces: list[str] = []
+        last_end = 0
+        for idx, match in enumerate(_DMS.finditer(raw)):
+            pieces.append(raw[last_end : match.start()])
+            pieces.append(f"@@{idx}@@ ")
+            last_end = match.end()
+        pieces.append(raw[last_end:])
+        masked = "".join(pieces)
+        tokens = [p for p in _COORD_SEP.split(masked) if p]
+        if len(tokens) != 2:
+            return None
+        out: list[float | None] = []
+        for token in tokens:
+            slot = re.fullmatch(r"@@(\d+)@@", token)
+            out.append(atoms[int(slot.group(1))] if slot else _plain_atom(token))
+        if out[0] is None or out[1] is None:
+            return None
+        return out[0], out[1]
+
+    parts = [p for p in _COORD_SEP.split(raw) if p]
     if len(parts) != 2:
         return None
-    try:
-        return float(parts[0]), float(parts[1])
-    except ValueError:
+    first, second = _plain_atom(parts[0]), _plain_atom(parts[1])
+    if first is None or second is None:
         return None
+    return first, second
 
 
 def looks_like_coord(text: str) -> bool:
@@ -133,11 +212,20 @@ def coord_error(text: str) -> str:
     """坐标写错时给一句能直接照抄的提示。"""
     pair = _number_pair(text)
     if pair is None:
+        if _dms_atoms(text) and len(list(_DMS.finditer(text))) != 2:
+            return (
+                "度分秒要两个点都写符号，例如 117°8'2\",39°13'53\"（经度在前）。\n"
+                "只有度分秒、没有 ° 和 ' 的数字串分不开哪个是哪个。"
+            )
         return "坐标格式是「经度,纬度」，例如 117.21,39.13（天津）。"
     lon, lat = pair
     head = "坐标顺序是「经度,纬度」——经度在前，纬度在后。"
     if abs(lat) > 90 >= abs(lon):
-        return f"{head}\n你写的 {lon:g},{lat:g} 纬度超了 ±90，应该是 {lat:g},{lon:g}。"
+        raw = [m.group(0).strip() for m in _DMS.finditer(text)]
+        fixed = f"{raw[1]},{raw[0]}" if len(raw) == 2 else f"{lat:g},{lon:g}"
+        return (
+            f"{head}\n你写的是「纬度,经度」，纬度 117° 那种值超不过 ±90 的只有经度。\n改成：{fixed}"
+        )
     return f"{head}\n经度范围 ±180、纬度范围 ±90，你写的是 {lon:g},{lat:g}。"
 
 

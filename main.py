@@ -49,6 +49,7 @@ from .qw.commands import Commands, join_place
 from .qw.keys import KeyStore, KeyWizard
 from .qw.pushers import Pusher
 from .qw.store import SubStore
+from .qw.usage import UsageLedger
 from .qw.workday import (
     DEFAULT_CALENDAR_DATE,
     DEFAULT_CLEANUP_DATE,
@@ -105,6 +106,14 @@ _SUB_ALIASES = {
     "上班日": "_cmd_workday",
     "节假日": "_cmd_workday",
     "workday": "_cmd_workday",
+    "设置": "_cmd_settings",
+    "配置": "_cmd_settings",
+    "settings": "_cmd_settings",
+    "成本": "_cmd_cost",
+    "费用": "_cmd_cost",
+    "花钱": "_cmd_cost",
+    "估算": "_cmd_cost",
+    "cost": "_cmd_cost",
     "帮助": "_help_text",
     "help": "_help_text",
     "用法": "_help_text",
@@ -135,6 +144,7 @@ def help_text() -> str:
 地点可以写城市名或坐标：
 · 城市名最多到区县（省 / 市 / 区县），街道乡镇查不到
 · 坐标写作「经度,纬度」，例如 117.21,39.13（天津），精度约 1 km
+· 度数分秒也认：117°8'2",39°13'53"（照样是经度在前）
 · 坐标会反查出所属区县，名字照常显示，预警按该区县匹配
 
 推送：
@@ -143,14 +153,17 @@ def help_text() -> str:
 {c("预警")}　　　　　　　灾害预警提醒
 　想指定别的地址，在命令里加「地址=2」
 　推送规则加「日=工作日」，就只在上班日推（调休上班算工作日）
+　内容写「全部」就是 8 项全要，「全部除now」是除实况以外全要
 
 工具：
 {c("工作日")}　　　　　　今天 / 指定日期是不是工作日（含节假日与调休）
 
 配置：
 {c("key")}　　　　　　　 查看凭据（支持本会话专用 key）
-{c("额度")}　　　　　　　余额与请求量
-{c("额度推送")}　　　　　把额度报告按固定时间推送（用本会话的 key）"""
+{c("额度")}　　　　　　　余额与当天 / 前一天请求量
+{c("额度推送")}　　　　　把额度报告按固定时间推送（用本会话的 key）
+{c("设置")}　　　　　　　导出本会话的全部设置
+{c("成本")}　　　　　　　按当前设置算每月请求量和花多少钱"""
 
 
 class QWeatherPlugin(Star):
@@ -181,6 +194,8 @@ class QWeatherPlugin(Star):
             cleanup_date=parse_month_day(self._cfg_str("cleanup_date"), DEFAULT_CLEANUP_DATE),
             timeout=self._cfg_float("http_timeout", 12.0),
         )
+        # 用量账本：接口只给最近 24 小时，切不出完整的「昨天」，所以自己按天攒
+        self._ledger = UsageLedger(data_dir / "usage.json")
         self._commands = Commands(
             self._subs,
             self._keys,
@@ -188,8 +203,16 @@ class QWeatherPlugin(Star):
             self._client_for,
             self._resolve_place,
             self._calendar,
+            self._ledger,
         )
-        self._pusher = Pusher(self._subs, self._keys, self._client_for, self._send, self._calendar)
+        self._pusher = Pusher(
+            self._subs,
+            self._keys,
+            self._client_for,
+            self._send,
+            self._calendar,
+            self._ledger,
+        )
 
         self._clients: dict[str, QWeatherClient] = {}
         self._pending_city: dict[str, float] = {}
@@ -200,6 +223,7 @@ class QWeatherPlugin(Star):
         await self._subs.load()
         await self._keys.load()
         await self._calendar.load()
+        await self._ledger.load()
         # 启动时补一次：当年缺数据要拉，过了 11-01 还要顺手把次年的拉下来。
         # 后台跑，不阻塞 AstrBot 启动。
         self._calendar.kick(datetime.now(), startup=True)
@@ -392,6 +416,12 @@ class QWeatherPlugin(Star):
 
     async def _cmd_workday(self, umo: str, args: list[str]) -> str:
         return await self._commands.handle_workday(umo, args)
+
+    async def _cmd_settings(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_settings(umo, args)
+
+    async def _cmd_cost(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_cost(umo, args)
 
     # ---------------------------------------------------------------- 天气实现
 

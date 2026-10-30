@@ -210,16 +210,41 @@ def parse_offset(text: str) -> int:
 
 
 def parse_content(text: str) -> list[str]:
-    items = [c for c in re.split(r"[,，、\s]+", (text or "").strip()) if c]
-    if not items:
+    """``内容=`` 后面的值 → 内容项列表。
+
+    支持三种写法：
+
+    - 逐项列：``now,daily,sun``
+    - 全部：``全部``（等于 8 项全要，一次推送会打 8 个接口）
+    - 全部扣除：``全部除now`` / ``全部除now,sun`` / ``全部-now``
+
+    ``全部`` 后面的扣除列表用逗号或空格分隔；内容项本身都是英文标识符，不含空格，
+    所以随便怎么分隔都行。
+    """
+    raw = (text or "").strip()
+    if not raw:
         raise ValueError("内容不能为空")
+
+    head = next((kw for kw in ("全部", "所有", "all") if raw.lower().startswith(kw)), "")
+    if head:
+        rest = raw[len(head) :].strip()
+        rest = re.sub(r"^\s*(?:[除掉]|扣除|减去|[-—])\s*", "", rest)
+        drop = [c for c in re.split(r"[,，、\s]+", rest) if c]
+        unknown = [c for c in drop if c not in CONTENT_LABEL]
+        if unknown:
+            raise ValueError(f"不认识的内容项：{', '.join(unknown)}")
+        ordered = [c for c in CONTENT_LABEL if c not in drop]
+        if not ordered:
+            raise ValueError("全部都被除掉了，那这条规则没什么可推的")
+        return ordered
+
+    items = [c for c in re.split(r"[,，、\s]+", raw) if c]
     unknown = [c for c in items if c not in CONTENT_LABEL]
     if unknown:
         raise ValueError(f"不认识的内容项：{', '.join(unknown)}")
     # 去重但保序
     seen: set[str] = set()
-    ordered = [c for c in items if not (c in seen or seen.add(c))]
-    return ordered
+    return [c for c in items if not (c in seen or seen.add(c))]
 
 
 def parse_days(text: str) -> str:
@@ -507,11 +532,24 @@ def describe_rule(rule: dict[str, Any], idx: int | None = None) -> str:
     else:
         when = kind
 
-    content = "+".join(CONTENT_LABEL.get(c, c) for c in rule.get("content") or [])
+    content = content_text(rule.get("content") or [])
     mode = normalize_days(rule.get("days"))
     day_tag = "" if mode == "all" else f"〔{DAY_LABEL[mode]}〕"
     head_line = f"{head}{flag}{when}{day_tag}"
     return f"{head_line}｜{content}{title}" if content else f"{head_line}{title}"
+
+
+def content_text(items: list[str]) -> str:
+    """内容项 → 一行摘要。8 项全要写「全部内容」，只差几项写「全部除 xx」。"""
+    picked = [c for c in CONTENT_LABEL if c in items]
+    if not picked:
+        return ""
+    if len(picked) == len(CONTENT_LABEL):
+        return "全部内容"
+    if len(picked) >= 5:
+        drop = [c for c in CONTENT_LABEL if c not in items]
+        return "全部除" + "+".join(CONTENT_LABEL[c] for c in drop)
+    return "+".join(CONTENT_LABEL[c] for c in picked)
 
 
 def month_days(year: int, month: int) -> int:

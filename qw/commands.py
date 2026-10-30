@@ -25,11 +25,12 @@ from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from . import quota, render, schedule
+from . import cost, naming, quota, render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore, KeyWizard
 from .naming import cmd
-from .store import MAX_LOCATIONS, SubStore, normalize_level
+from .store import LEVEL_LABEL, MAX_LOCATIONS, SubStore, normalize_level
+from .usage import UsageLedger
 from .workday import WorkdayCalendar
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
@@ -75,7 +76,19 @@ def address_help() -> str:
 推送指令默认作用在当前地址，加「地址=2」可临时指定。"""
 
 
-LEVEL_LABEL = {"blue": "蓝色", "yellow": "黄色", "orange": "橙色", "red": "红色"}
+COST_HELP = f"""成本估算：把当前会话的所有设置折成每月请求次数和钱。
+{cmd("成本")}　　　　　　先列全部设置，再算每月成本
+{cmd("成本 明细")}　　　只算成本，不列设置
+{cmd("成本 设置")}　　　只看设置
+
+计价按和风官方「天气和基础服务」阶梯价：每月前 50,000 次免费，超出部分
+7 元 / 万次起，用得越多单价越低。插件自己用到的接口全在这一档里。
+
+估算含插件的缓存折减（逐时预报 1 小时、日出日落 30 分钟、预警列表 5 分钟一次），
+不含你手动发指令查询的部分——那取决于人，不取决于设置。
+
+设置总览单独看：{cmd("设置")}
+"""
 
 # 内容项 -> 需要拉哪些数据（minutely 单独处理，因为要按降水概率预筛）
 CONTENT_FETCH = {
@@ -222,6 +235,7 @@ class Commands:
         client_factory: ClientFactory,
         resolve_place: PlaceResolver | None = None,
         calendar: WorkdayCalendar | None = None,
+        ledger: UsageLedger | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
@@ -229,6 +243,7 @@ class Commands:
         self._client = client_factory
         self._resolve = resolve_place
         self._calendar = calendar
+        self._ledger = ledger
 
     # ================================================================ 地址
 
@@ -648,6 +663,13 @@ class Commands:
             await self._store.patch_section(umo, lid, "precip", {"windows": windows})
             return f"🗑 已删除时段 {schedule.window_text([removed])}\n" + self._window_list(windows)
 
+        if head in ("清时段", "清空时段", "重置时段"):
+            await self._store.patch_section(umo, lid, "precip", {"windows": []})
+            return (
+                "✅ 时段已清空（清空 = 全天可提醒）。\n"
+                f"接下来用「{cmd('雨雪 加时段 工作日 08:00-12:00')}」一个个加。"
+            )
+
         if head in ("间隔", "轮询"):
             if not rest or not rest[0].isdigit():
                 return f"用法：{cmd('雨雪 间隔 10')}（分钟，范围 5-60）"
@@ -683,7 +705,7 @@ class Commands:
                 f"　降水结束：{'开' if cfg.get('on_stop') else '关'}",
                 f"提前量：{cfg.get('lead_minutes')} 分钟　轮询：{cfg.get('poll_interval')} 分钟",
                 "",
-                "本指令后接：加时段 08:00-12:00｜加时段 工作日 08:00-18:00｜删时段 2",
+                "本指令后接：加时段 工作日 08:00-12:00｜删时段 2｜清时段",
                 "　　　　　间隔 10｜提前 60｜开始 开｜结束 关",
             ]
         )
@@ -745,12 +767,26 @@ class Commands:
             await self._store.patch_section(umo, lid, "alert", {"min_level": level})
             return f"✅ 最低推送等级：{LEVEL_LABEL[level]}"
 
-        if head in ("升级",):
+        if head in ("升级", "降级", "变化"):
             if not rest or rest[0] not in ("开", "关", "on", "off"):
-                return f"用法：{cmd('预警 升级 开|关')}"
+                return (
+                    f"用法：{cmd('预警 升级 开|关')}　或　{cmd('预警 降级 开|关')}\n"
+                    f"{cmd('预警 变化 开')}　升级和降级一起开关"
+                )
             enabled = rest[0] in ("开", "on")
-            await self._store.patch_section(umo, lid, "alert", {"notify_on_upgrade": enabled})
-            return f"✅ 等级升高再推送：{'开启' if enabled else '关闭'}"
+            if head == "升级":
+                await self._store.patch_section(umo, lid, "alert", {"notify_on_upgrade": enabled})
+                return f"✅ 等级升高再推：{'开启' if enabled else '关闭'}"
+            if head == "降级":
+                await self._store.patch_section(umo, lid, "alert", {"notify_on_downgrade": enabled})
+                return f"✅ 等级降低再推：{'开启' if enabled else '关闭'}"
+            await self._store.patch_section(
+                umo,
+                lid,
+                "alert",
+                {"notify_on_upgrade": enabled, "notify_on_downgrade": enabled},
+            )
+            return f"✅ 等级变化（升或降）再推：{'开启' if enabled else '关闭'}"
 
         if head in ("加时段", "加"):
             if not rest:
@@ -773,6 +809,13 @@ class Commands:
             windows.pop(idx)
             await self._store.patch_section(umo, lid, "alert", {"windows": windows})
             return self._window_list(windows)
+
+        if head in ("清时段", "清空时段", "重置时段"):
+            await self._store.patch_section(umo, lid, "alert", {"windows": []})
+            return (
+                "✅ 时段已清空（清空 = 全天可提醒）。\n"
+                f"接下来用「{cmd('预警 加时段 工作日 08:00-12:00')}」一个个加。"
+            )
 
         if head in ("列时段", "时段"):
             return self._window_list(cfg.get("windows") or [])
@@ -807,10 +850,11 @@ class Commands:
                 f"轮询间隔：{cfg.get('poll_interval')} 分钟（默认 60）",
                 f"最低推送等级：{LEVEL_LABEL.get(level, level)}",
                 f"可提醒时段：{schedule.window_text(cfg.get('windows') or [])}",
-                f"等级升高再推：{'开' if cfg.get('notify_on_upgrade') else '关'}",
+                f"等级变化再推：升高 {'开' if cfg.get('notify_on_upgrade') else '关'}"
+                f"　降低 {'开' if cfg.get('notify_on_downgrade', True) else '关'}",
                 "",
-                "本指令后接：间隔 60｜等级 橙｜升级 开｜加时段 07:00-23:00",
-                "　　　　　加时段 工作日 08:00-18:00｜删时段 1｜测试",
+                "本指令后接：间隔 60｜等级 橙｜升级 开｜降级 开｜变化 开",
+                "　　　　　加时段 工作日 08:00-12:00｜删时段 1｜清时段｜测试",
             ]
         )
 
@@ -967,6 +1011,118 @@ class Commands:
             f"发「{cmd('key 默认')}」可恢复系统 key。"
         )
 
+    # ================================================================ 设置与成本
+
+    async def handle_settings(self, umo: str, args: list[str]) -> str:  # noqa: ARG002
+        return await self._settings_text(umo)
+
+    async def handle_cost(self, umo: str, args: list[str]) -> str:
+        """默认把「全部设置 + 每月成本」一起给出来，一个命令回答「我这样配要花多少」。"""
+        head = args[0].lower() if args else ""
+        if head in ("帮助", "help", "?", "？"):
+            return COST_HELP
+        session = await self._store.session(umo) or {}
+        est = cost.estimate_session(session, cal=self._calendar)
+        body = cost.render(est, key_note=await self._key_note(umo))
+        if head in ("明细", "detail", "cost", "钱"):
+            return body
+        if head in ("设置", "settings", "导出"):
+            return await self._settings_text(umo)
+        return await self._settings_text(umo) + "\n\n" + "─" * 10 + "\n\n" + body
+
+    async def _settings_text(self, umo: str) -> str:
+        session = await self._store.session(umo) or {}
+        locations = session.get("locations") or []
+        active = next((loc for loc in locations if loc.get("active")), None)
+
+        lines: list[str] = []
+        lines.append(f"指令前缀：/{naming.prefix()}")
+        lines.append(f"凭据：{await self._key_note(umo) or '系统默认 key'}")
+        if self._calendar is not None:
+            years = self._calendar.years()
+            today = date.today()
+            ready = [y for y in years if self._calendar.has_data(y)]
+            tag = "、".join(str(y) for y in ready) or "无"
+            lines.append(
+                f"工作日日历：{tag} 有数据"
+                + (
+                    "（当年缺数据，按周一至周五估算）"
+                    if not self._calendar.has_data(today.year)
+                    else ""
+                )
+            )
+
+        if not locations:
+            lines.append("")
+            lines.append("还没有地址。")
+            return "\n".join(lines)
+
+        for idx, loc in enumerate(locations, 1):
+            mark = "　▶ 当前" if loc is active else ""
+            label = render.loc_label(loc)
+            lines.append("")
+            lines.append(f"【{idx}】{label}{mark}")
+
+            rules = loc.get("rules") or []
+            lines.append(f"　推送规则：{len(rules)} 条" if rules else "　推送规则：无")
+            for n, rule in enumerate(rules, 1):
+                flag = "" if rule.get("enabled", True) else "【已关闭】"
+                lines.append(f"　　{flag}{schedule.describe_rule(rule, n)}")
+
+            precip = loc.get("precip") or {}
+            if precip.get("enabled"):
+                kinds = []
+                if precip.get("on_start"):
+                    kinds.append(f"开始（提前 {precip.get('lead_minutes', 60)} 分钟）")
+                if precip.get("on_stop"):
+                    kinds.append(f"结束（提前 {precip.get('lead_minutes', 60)} 分钟）")
+                lines.append(
+                    f"　雨雪提醒：开　轮询 {precip.get('poll_interval')} 分钟　"
+                    + "、".join(kinds or ["什么都没勾"])
+                )
+                lines.append(f"　　时段：{self._window_brief(precip.get('windows') or [])}")
+            else:
+                lines.append("　雨雪提醒：关")
+
+            alert = loc.get("alert") or {}
+            if alert.get("enabled"):
+                lines.append(
+                    f"　灾害预警：开　轮询 {alert.get('poll_interval')} 分钟　"
+                    f"{LEVEL_LABEL.get(alert.get('min_level') or 'yellow')}及以上"
+                )
+                lines.append(
+                    f"　　等级变化：升高 {'推' if alert.get('notify_on_upgrade') else '不推'}"
+                    f"　降低 {'推' if alert.get('notify_on_downgrade', True) else '不推'}"
+                )
+                lines.append(f"　　时段：{self._window_brief(alert.get('windows') or [])}")
+            else:
+                lines.append("　灾害预警：关")
+
+        quota_rules = (session.get("quota") or {}).get("rules") or []
+        lines.append("")
+        if quota_rules:
+            lines.append(f"【额度推送】{len(quota_rules)} 条（按会话存，不挂地址）")
+            for n, rule in enumerate(quota_rules, 1):
+                flag = "" if rule.get("enabled", True) else "【已关闭】"
+                lines.append(f"　{flag}{schedule.describe_rule(rule, n)}")
+        else:
+            lines.append("【额度推送】无")
+
+        lines.append("")
+        lines.append(f"算每月成本：{cmd('成本')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _window_brief(windows: list[dict[str, Any]]) -> str:
+        if not windows:
+            return "全天"
+        parts = []
+        for window in windows:
+            mode = schedule.normalize_days(window.get("days"))
+            prefix = "" if mode == "all" else f"{schedule.DAY_LABEL[mode]} "
+            parts.append(f"{prefix}{window.get('start')}-{window.get('end')}")
+        return "　".join(parts)
+
     # ================================================================ 额度
 
     async def handle_quota(self, umo: str) -> str:
@@ -974,7 +1130,9 @@ class Commands:
             client = await self._client(umo)
         except QWeatherError as exc:
             return f"❌ {exc}"
-        return await quota.build_report(client, key_note=await self._key_note(umo))
+        return await quota.build_report(
+            client, key_note=await self._key_note(umo), ledger=self._ledger
+        )
 
     async def _key_note(self, umo: str) -> str:
         """这次用的是哪套 key。额度推送必须说清楚，否则用户会疑惑「谁的余额」。"""

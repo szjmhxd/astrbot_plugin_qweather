@@ -127,7 +127,12 @@ from astrbot_plugin_qweather.qw.render import (  # noqa: E402
     place_label,
     short_label,
 )
-from astrbot_plugin_qweather.qw.store import SubStore, blank_location  # noqa: E402
+from astrbot_plugin_qweather.qw.store import (  # noqa: E402
+    SubStore,
+    blank_location,
+    level_rank,
+    normalize_level,
+)  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -584,6 +589,29 @@ def test_coord() -> None:
     # 输出格式：输入、展示、请求三处统一「经度,纬度」
     check("format_coord 经度在前", format_coord(39.13, 117.21) == "117.21,39.13")
     check("geo_location 给和风", geo_location(39.13, 117.21) == "117.21,39.13")
+
+    section("坐标：度分秒写法")
+    # 117°8'2" = 117 + 8/60 + 2/3600 = 117.1339 → 截两位 117.13
+    # 39°13'53" = 39 + 13/60 + 53/3600 = 39.2314 → 截两位 39.23
+    dms = "117°8'2\",39°13'53\""
+    check("度分秒：标准写法", parse_latlon(dms) == (39.23, 117.13), str(parse_latlon(dms)))
+    check("度分秒：单引号当秒", parse_latlon("117°8'2',39°13'53''") == (39.23, 117.13))
+    check("度分秒：中文单位", parse_latlon("117度8分2秒,39度13分53秒") == (39.23, 117.13))
+    check("度分秒：全角撇号", parse_latlon("117°8′2″,39°13′53″") == (39.23, 117.13))
+    check("度分秒：只有度分", parse_latlon("117°8',39°13'") == (39.22, 117.13))
+    check("度分秒：和十进制混写", parse_latlon("117°8'2\",39.23") == (39.23, 117.13))
+    check("度分秒：空格分隔两个点", parse_latlon("117°8'2\" 39°13'53\"") == (39.23, 117.13))
+    check("度分秒：纬度在前要拒绝", parse_latlon("39°13'53\",117°8'2\"") is None)
+    check("度分秒：分钟超 60 不算坐标", parse_latlon("117°88'0\",39°13'0\"") is None)
+    check(
+        "度分秒：写反了给出可复制的正确写法",
+        "117°8'2\",39°13'53\"" in coord_error("39°13'53\",117°8'2\""),
+        coord_error("39°13'53\",117°8'2\""),
+    )
+    check("方位词：后缀", parse_latlon("117.13E,39.23N") == (39.23, 117.13))
+    check("方位词：前缀", parse_latlon("E117.13,N39.23") == (39.23, 117.13))
+    check("方位词：S 为负", parse_latlon("151.21E,33.87S") == (-33.87, 151.21))
+    check("裸数字串分不开就拒绝", parse_latlon("117 8 2, 39 13 53") is None)
 
     section("地点标签")
     city = {"name": "杭州", "adm1": "浙江省", "adm2": "杭州"}
@@ -1454,6 +1482,246 @@ class _FakeEvent:
         self.stopped = True
 
 
+def test_content_all() -> None:
+    section("内容项：全部 / 全部除 xx")
+    full = schedule.parse_content("全部")
+    check("全部 = 8 项", len(full) == 8, str(full))
+    check("全部包含 now", "now" in full and "minutely" in full)
+    check("全部除 now", "now" not in schedule.parse_content("全部除now"))
+    check("全部-now 也认", "now" not in schedule.parse_content("全部-now"))
+    drop = schedule.parse_content("全部除now,sun")
+    check("一次除多项", "now" not in drop and "sun" not in drop and len(drop) == 6, str(drop))
+    check("空格分隔扣除项", len(schedule.parse_content("全部除 now sun")) == 6)
+    check("逐项写法照旧", schedule.parse_content("now,daily") == ["now", "daily"])
+    check("去重保序", schedule.parse_content("daily,now,daily") == ["daily", "now"])
+
+    for bad, label in (
+        ("全部除xyz", "除未知项"),
+        ("全部除now,daily,hourly,air,indices,alert,sun,minutely", "全除光"),
+    ):
+        try:
+            schedule.parse_content(bad)
+            check(f"{label}要报错", False)
+        except ValueError:
+            check(f"{label}要报错", True)
+
+    section("规则摘要：内容多时不糊屏")
+    rule = {"kind": "clock", "at": "08:00", "content": full}
+    check(
+        "8 项写「全部内容」",
+        "全部内容" in schedule.describe_rule(rule),
+        schedule.describe_rule(rule),
+    )
+    rule7 = {"kind": "clock", "at": "21:30", "content": [c for c in full if c != "now"]}
+    text = schedule.describe_rule(rule7)
+    check("7 项写「全部除实况」", "全部除实况" in text, text)
+
+
+def test_alert_change() -> None:
+    section("预警：等级升高 / 降低都要能配")
+
+    from astrbot_plugin_qweather.qw.commands import Commands
+    from astrbot_plugin_qweather.qw.pushers import Pusher
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "alert_change_test.json"
+        if path.exists():
+            path.unlink()
+        store = SubStore(path)
+        await store.load()
+        umo = "test:GroupMessage:alert"
+        loc, _ = await store.add_location(
+            umo, {"name": "北辰", "id": "101030200", "lat": 39.23, "lon": 117.13}, ""
+        )
+        assert loc is not None
+        cmds = Commands(store, None, KeyWizard(), lambda u: None, None, None)
+        lid = loc["lid"]
+
+        await cmds.handle_alert(umo, ["降级", "关"])
+        cfg = await store.get_section(umo, lid, "alert")
+        check("降级能单独关", cfg.get("notify_on_downgrade") is False)
+        check("关降级不影响升级", cfg.get("notify_on_upgrade") is True)
+
+        await cmds.handle_alert(umo, ["变化", "开"])
+        cfg = await store.get_section(umo, lid, "alert")
+        check(
+            "变化 开 = 升降都开",
+            cfg.get("notify_on_upgrade") is True and cfg.get("notify_on_downgrade") is True,
+        )
+
+        await cmds.handle_alert(umo, ["变化", "关"])
+        cfg = await store.get_section(umo, lid, "alert")
+        check(
+            "变化 关 = 升降都关",
+            cfg.get("notify_on_upgrade") is False and cfg.get("notify_on_downgrade") is False,
+        )
+
+        await cmds.handle_alert(umo, ["升级", "开"])
+        await cmds.handle_alert(umo, ["降级", "开"])
+        view = await cmds.handle_alert(umo, [])
+        check("视图里写明升降两档", "降低 开" in view, view)
+
+    asyncio.run(run())
+
+    loc = {"name": "公司", "city": {"name": "北辰"}}
+    # 和风 /v7/warning/now 的 level 就是这种两个汉字，单字、英文也得认
+    hot = {"level": "黄色", "type_name": "大风", "title": "T"}
+    cool = {"level": "蓝色", "type_name": "大风", "title": "T"}
+    up = Pusher._alert_text(loc, hot, cool)
+    down = Pusher._alert_text(loc, cool, hot)
+    check("升级标 ↑", "↑" in up and "蓝色→黄色" in up, up)
+    check("降级标 ↓", "↓" in down and "黄色→蓝色" in down, down)
+    check("首次推送不带箭头", "↑" not in Pusher._alert_text(loc, hot, None))
+    check("等级没变不带箭头", "→" not in Pusher._alert_text(loc, hot, {"level": "黄色"}))
+    check("英文等级也显示成中文", "黄色" in Pusher._alert_text(loc, {"level": "yellow"}))
+
+    section("预警等级：双字 / 单字 / 英文都要认")
+    check("双字「黄色」= 2 级", level_rank("黄色") == 2)
+    check("单字「黄」= 2 级", level_rank("黄") == 2)
+    check("双字「橙色」= 3 级", level_rank("橙色") == 3)
+    check("英文 red = 4 级", level_rank("red") == 4)
+    check("大写也认", level_rank("ORANGE") == 3)
+    check("认不出的不猜", level_rank("紫色") == 0)
+    check("normalize 双字", normalize_level("黄色") == "yellow")
+    check("normalize 白色归蓝色", normalize_level("白色") == "blue")
+
+
+def test_usage_ledger() -> None:
+    section("用量账本：按本地日期分桶")
+    from astrbot_plugin_qweather.qw.usage import UsageLedger, split_hours
+
+    # asOf 02:59Z = 北京时间 10:59，hours 最后一条是 02:00-02:59Z = 本地 10 点档
+    stats = {
+        "asOf": "2026-10-30T02:59Z",
+        "success": [{"api": "Weather", "hours": [3] + [0] * 22 + [5]}],
+        "errors": [{"api": "Weather", "hours": [0] * 23 + [1]}],
+    }
+    rows = split_hours(stats)
+    check("跨了两个本地日期", set(rows) == {"2026-10-29", "2026-10-30"}, str(sorted(rows)))
+    check("前一天 3 次", rows["2026-10-29"]["total"] == 3, str(rows["2026-10-29"]))
+    check("当天成功 + 失败都算", rows["2026-10-30"]["total"] == 6, str(rows["2026-10-30"]))
+    check("失败单独记", rows["2026-10-30"]["err"].get("Weather") == 1)
+    check("空数据不进账", split_hours({"asOf": "2026-10-30T02:59Z"}) == {})
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "usage_test.json"
+        if path.exists():
+            path.unlink()
+        ledger = UsageLedger(path)
+        await ledger.load()
+        small = {
+            "asOf": "2026-10-30T02:59Z",
+            "success": [{"api": "Weather", "hours": [0] * 23 + [5]}],
+            "errors": [],
+        }
+        big = {
+            "asOf": "2026-10-30T02:59Z",
+            "success": [{"api": "Weather", "hours": [1] * 24}],
+            "errors": [],
+        }
+        await ledger.merge(small)
+        await ledger.merge(big)
+        await ledger.merge(small)  # 回退的旧数据不能把已有的大值改小
+        today = date(2026, 10, 30)
+        check("同一天取较大值", ledger.day(today)["total"] == 11, str(ledger.day(today)))
+        check("前一天按 13 条算", ledger.day(date(2026, 10, 29))["total"] == 13)
+        check("账本落盘", path.exists())
+
+        again = UsageLedger(path)
+        await again.load()
+        check("重新加载还在", again.day(today)["total"] == 11)
+        check("没记录的日期返回空账", again.day(date(2020, 1, 1))["total"] == 0)
+
+        # 先清掉今天的记录再测「昨天没有数据」这种情况
+        for name in (path, path.with_suffix(".tmp")):
+            if name.exists():
+                name.unlink()
+
+    asyncio.run(run())
+
+
+def test_cost() -> None:
+    section("成本：阶梯价")
+    from astrbot_plugin_qweather.qw.cost import FREE_QUOTA, estimate_session, month_cost
+
+    check("免费额度内为 0", month_cost(FREE_QUOTA) == 0)
+    check("一分钱都不收", month_cost(0) == 0)
+    # 官方示例：100 万次 = 50000×0 + 950000×0.0007 = 665 元
+    check("100 万次 ≈ 665 元", abs(month_cost(1_000_000) - 665) < 0.01, str(month_cost(1_000_000)))
+    check("超出 1 万次 = 7 元", abs(month_cost(60_000) - 7) < 0.01, str(month_cost(60_000)))
+
+    section("成本：设置折成请求次数")
+    session = {
+        "locations": [
+            {
+                "lid": "L1",
+                "name": "家",
+                "city": {"lat": 39.23, "lon": 117.13},
+                "rules": [
+                    {
+                        "id": "r1",
+                        "kind": "clock",
+                        "at": "08:00",
+                        "content": ["now", "daily"],
+                        "days": "all",
+                        "enabled": True,
+                    }
+                ],
+                "precip": {"enabled": False},
+                "alert": {"enabled": False},
+            }
+        ],
+        "quota": {"rules": []},
+    }
+    est = estimate_session(session, today=date(2026, 10, 30))
+    # 10 月 31 天，每天一条规则 × 2 项 = 62 次
+    check("每天规则按当月天数算", est.total == 62, str(est.total))
+    check("当月在免费额度内", est.cost == 0)
+    check("工作日数在合理范围", 18 <= est.workdays <= 23, str(est.workdays))
+
+    # 加一条只在工作日推的，次数应该明显少于一整月
+    session["locations"][0]["rules"].append(
+        {
+            "id": "r2",
+            "kind": "clock",
+            "at": "21:30",
+            "content": ["now"],
+            "days": "workday",
+            "enabled": True,
+        }
+    )
+    est2 = estimate_session(session, today=date(2026, 10, 30))
+    check("工作日规则按工作日数算", est2.total == 62 + est2.workdays, str(est2.total))
+
+    # sun 不额外计费：全部 8 项实际 7 次
+    session["locations"][0]["rules"] = [
+        {
+            "id": "r3",
+            "kind": "clock",
+            "at": "08:00",
+            "content": ["now", "daily", "hourly", "air", "indices", "alert", "sun", "minutely"],
+            "days": "all",
+            "enabled": True,
+        }
+    ]
+    est3 = estimate_session(session, today=date(2026, 10, 30))
+    check("全部 8 项按 7 次请求算", est3.total == 31 * 7, str(est3.total))
+
+    session["locations"][0]["rules"] = [
+        {"id": "r4", "kind": "clock", "at": "08:00", "content": ["sun"], "days": "all"}
+    ]
+    est4 = estimate_session(session, today=date(2026, 10, 30))
+    check("只要日出日落仍拉一次 daily", est4.total == 31, str(est4.total))
+
+    off = {
+        "locations": [
+            {"lid": "L1", "name": "家", "city": {}, "rules": [], "precip": {}, "alert": {}}
+        ],
+        "quota": {"rules": []},
+    }
+    check("没绑地点的地址不产生请求", estimate_session(off).total == 0)
+
+
 # ---------------------------------------------------------------- 主流程
 
 
@@ -1468,7 +1736,11 @@ def main() -> int:
     test_pusher()
     test_workday()
     test_day_rules()
+    test_content_all()
+    test_alert_change()
     test_quota_push()
+    test_usage_ledger()
+    test_cost()
     test_keys()
     test_render()
     test_naming()

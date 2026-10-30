@@ -61,7 +61,10 @@ DEFAULT_ALERT: dict[str, Any] = {
     "poll_interval": 60,
     "min_level": "yellow",
     "windows": [{"start": "07:00", "end": "23:00", "days": "all"}],
+    # 同一条预警等级变了要不要再推一次。降级也算变化：橙色转黄说明在缓解，
+    # 用户照样需要知道，所以两个默认都是开。
     "notify_on_upgrade": True,
+    "notify_on_downgrade": True,
 }
 
 DEFAULT_RULE: dict[str, Any] = {
@@ -107,6 +110,7 @@ LEVEL_ORDER = {
 }
 LEVEL_ALIAS = {
     "blue": "blue",
+    "白": "blue",
     "蓝": "blue",
     "yellow": "yellow",
     "黄": "yellow",
@@ -115,14 +119,42 @@ LEVEL_ALIAS = {
     "red": "red",
     "红": "red",
 }
+LEVEL_LABEL = {"blue": "蓝色", "yellow": "黄色", "orange": "橙色", "red": "红色"}
+
+# 和风 /v7/warning/now 的 level 是「蓝色」「黄色」「橙色」「红色」这种**两个汉字**，
+# 不是「蓝」「黄」。只认单字会让等级全部落到 0，进而被最低等级过滤挡掉——预警一条都
+# 推不出去，而且不报错。所以这里统一按「包含」判断，单字、双字、英文都能认。
+_LEVEL_EN = ("red", "orange", "yellow", "blue")
+_LEVEL_CN = ("红", "橙", "黄", "蓝", "白")
+
+
+def level_key(text: str) -> str:
+    """任何写法的等级 → 规范 key（``blue`` / ``yellow`` / ``orange`` / ``red``）。"""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return ""
+    if raw in LEVEL_ORDER:
+        return raw
+    for word in _LEVEL_EN:
+        if word in raw:
+            return word
+    for word in _LEVEL_CN:
+        if word in raw:
+            return word
+    return ""
 
 
 def normalize_level(text: str) -> str | None:
-    return LEVEL_ALIAS.get((text or "").strip().lower())
+    return LEVEL_ALIAS.get(level_key(text))
 
 
 def level_rank(text: str) -> int:
-    return LEVEL_ORDER.get((text or "").strip().lower(), 0)
+    return LEVEL_ORDER.get(level_key(text), 0)
+
+
+def level_text(value: str) -> str:
+    """等级 → 给人看的中文。认不出来就原样返回，不吞掉信息。"""
+    return LEVEL_LABEL.get(level_key(value) or "", (value or "").strip())
 
 
 def new_rule_id() -> str:
