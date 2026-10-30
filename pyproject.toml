@@ -10,3 +10,4 @@ ignore = ["B008"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+line-ending = "lf"

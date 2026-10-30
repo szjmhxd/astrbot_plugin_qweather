@@ -22,14 +22,15 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
-from . import render, schedule
+from . import quota, render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore, KeyWizard
 from .naming import cmd
 from .store import MAX_LOCATIONS, SubStore, normalize_level
+from .workday import WorkdayCalendar
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
 # (umo, 用户输入) -> (地点 dict 或 None, 错误提示)
@@ -44,11 +45,16 @@ def push_help() -> str:
 {cmd("推送 加 每月 1,15 09:00 内容=daily")}
 {cmd("推送 加 每小时 8-20 0,30 内容=now,air")}
 {cmd("推送 加 日出 -30 内容=now,daily,sun")}
+{cmd("推送 加 每天 07:30 内容=daily 日=工作日")}
 {cmd("推送 改 1 时间=08:00 内容=now,daily")}
 {cmd("推送 开 1")}　　关 1　　删 1　　试 1
 
 内容可选：now 实况 / daily 预报 / hourly 逐时 / air 空气
 　　　　　indices 指数 / alert 预警 / sun 日出日落 / minutely 降水
+
+日条件可选：日=工作日（只在上班日推，调休上班算工作日）
+　　　　　　日=休息日（只在周末和法定节假日推）
+　　　　　　不写就是每天都推
 
 地址：{cmd("地址")} 查看与切换，「{cmd("地址 加 天津")}」新增一个地址。
 """
@@ -103,6 +109,9 @@ def _kv_split(tokens: list[str]) -> tuple[list[str], dict[str, str]]:
                 "interval": "间隔",
                 "name": "名称",
                 "place": "地点",
+                "day": "日",
+                "days": "日",
+                "workday": "日",
             }
             kv[alias.get(key.lower(), key)] = match.group(2).strip()
         else:
@@ -134,8 +143,14 @@ def join_place(tokens: list[str]) -> str:
     return " ".join(tokens).strip()
 
 
-def parse_rule(tokens: list[str]) -> dict[str, Any]:
-    """``加 ...`` 后面的参数 → 规则 dict。抛 ValueError 说明哪里写错了。"""
+def parse_rule(
+    tokens: list[str], *, with_content: bool = True, allow_solar: bool = True
+) -> dict[str, Any]:
+    """``加 ...`` 后面的参数 → 规则 dict。抛 ValueError 说明哪里写错了。
+
+    ``with_content=False`` 给额度推送用（它没有「内容」可选）；``allow_solar=False``
+    同理——额度推送没有地点，算不出日出日落。
+    """
     positional, kv = _kv_split(tokens)
     if not positional:
         raise ValueError("缺少触发方式：每天 / 每周 / 每月 / 每小时 / 日出 / 日落")
@@ -175,6 +190,10 @@ def parse_rule(tokens: list[str]) -> dict[str, Any]:
         rule["minutes"] = schedule.parse_minutes(rest[1]) if len(rest) > 1 else [0]
 
     elif kind_token in ("日出", "日落", "sunrise", "sunset"):
+        if not allow_solar:
+            raise ValueError(
+                "这里不支持日出日落（没有绑地点，算不出来），用 每天 / 每周 / 每月 / 每小时"
+            )
         rule["kind"] = "solar"
         rule["solar"] = "sunrise" if kind_token in ("日出", "sunrise") else "sunset"
         rule["offset"] = schedule.parse_offset(rest[0]) if rest else 0
@@ -182,8 +201,11 @@ def parse_rule(tokens: list[str]) -> dict[str, Any]:
     else:
         raise ValueError(f"不认识的触发方式：{kind_token}")
 
-    content_text = kv.get("内容") or "now,daily"
-    rule["content"] = schedule.parse_content(content_text)
+    if with_content:
+        content_text = kv.get("内容") or "now,daily"
+        rule["content"] = schedule.parse_content(content_text)
+    if kv.get("日"):
+        rule["days"] = schedule.parse_days(kv["日"])
     if kv.get("标题"):
         rule["title"] = kv["标题"][:20]
     return rule
@@ -199,12 +221,14 @@ class Commands:
         wizard: KeyWizard,
         client_factory: ClientFactory,
         resolve_place: PlaceResolver | None = None,
+        calendar: WorkdayCalendar | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
         self._wizard = wizard
         self._client = client_factory
         self._resolve = resolve_place
+        self._calendar = calendar
 
     # ================================================================ 地址
 
@@ -404,7 +428,10 @@ class Commands:
             f"✅ 已添加规则 {idx}（{render.loc_label(loc)}）",
             schedule.describe_rule(saved),
         ]
-        preview = await self._preview_next(umo, loc, saved)
+        try:
+            preview = await self._preview_next(umo, loc, saved)
+        except Exception:  # noqa: BLE001 推算下次触发失败不该让「加规则」整条失败
+            preview = ""
         if preview:
             lines.append(f"下次触发：{preview}")
         return "\n".join(lines)
@@ -464,7 +491,7 @@ class Commands:
 
     async def _preview_next(self, umo: str, loc: dict[str, Any], rule: dict[str, Any]) -> str:
         sun = await self._sun_times(umo, loc)
-        runs = schedule.next_runs(rule, datetime.now(), sun, limit=1)
+        runs = schedule.next_runs(rule, datetime.now(), sun, limit=1, day_filter=self._day_filter())
         return runs[0].strftime("%m-%d %H:%M") if runs else ""
 
     async def _sun_times(self, umo: str, loc: dict[str, Any]) -> dict[str, str] | None:
@@ -596,11 +623,14 @@ class Commands:
 
         if head in ("加时段", "加"):
             if not rest:
-                return f"用法：{cmd('雨雪 加时段 08:00-12:00')}"
-            window = self._parse_window(rest[0])
+                return (
+                    f"用法：{cmd('雨雪 加时段 08:00-12:00')}　或　"
+                    f"{cmd('雨雪 加时段 工作日 08:00-18:00')}"
+                )
+            window = self._parse_window(rest)
             windows = list(cfg.get("windows") or []) + [window]
             await self._store.patch_section(umo, lid, "precip", {"windows": windows})
-            return f"✅ 已添加时段 {window['start']}-{window['end']}\n" + self._precip_view(
+            return f"✅ 已添加时段 {schedule.window_text([window])}\n" + self._precip_view(
                 loc, await self._store.get_section(umo, lid, "precip")
             )
 
@@ -616,9 +646,7 @@ class Commands:
                 return f"没有第 {rest[0]} 个时段。"
             removed = windows.pop(idx)
             await self._store.patch_section(umo, lid, "precip", {"windows": windows})
-            return f"🗑 已删除时段 {removed['start']}-{removed['end']}\n" + self._window_list(
-                windows
-            )
+            return f"🗑 已删除时段 {schedule.window_text([removed])}\n" + self._window_list(windows)
 
         if head in ("间隔", "轮询"):
             if not rest or not rest[0].isdigit():
@@ -655,19 +683,15 @@ class Commands:
                 f"　降水结束：{'开' if cfg.get('on_stop') else '关'}",
                 f"提前量：{cfg.get('lead_minutes')} 分钟　轮询：{cfg.get('poll_interval')} 分钟",
                 "",
-                "本指令后接：加时段 08:00-12:00｜删时段 2｜间隔 10｜提前 60｜开始 开｜结束 关",
+                "本指令后接：加时段 08:00-12:00｜加时段 工作日 08:00-18:00｜删时段 2",
+                "　　　　　间隔 10｜提前 60｜开始 开｜结束 关",
             ]
         )
 
     @staticmethod
-    def _parse_window(text: str) -> dict[str, str]:
-        raw = (text or "").replace("~", "-").replace("到", "-")
-        parts = [p for p in re.split(r"[-—]", raw) if p.strip()]
-        if len(parts) != 2:
-            raise ValueError("时段格式：08:00-12:00")
-        start = schedule.fmt_clock(*schedule.parse_clock(parts[0]))
-        end = schedule.fmt_clock(*schedule.parse_clock(parts[1]))
-        return {"start": start, "end": end}
+    def _parse_window(tokens: list[str]) -> dict[str, str]:
+        """``["工作日", "08:00-12:00"]`` → 带日条件的时段。写法见 :func:`schedule.parse_window`。"""
+        return schedule.parse_window(tokens)
 
     @staticmethod
     def _window_list(windows: list[dict[str, str]]) -> str:
@@ -675,7 +699,7 @@ class Commands:
             return "没有配置时段（等于全天可提醒）。"
         lines = ["可提醒时段："]
         for idx, window in enumerate(windows, 1):
-            lines.append(f"  {idx}. {window.get('start')}-{window.get('end')}")
+            lines.append(f"  {idx}. {schedule.window_text([window])}")
         return "\n".join(lines)
 
     # ================================================================ 预警推送
@@ -730,11 +754,14 @@ class Commands:
 
         if head in ("加时段", "加"):
             if not rest:
-                return f"用法：{cmd('预警 加时段 07:00-23:00')}"
-            window = self._parse_window(rest[0])
+                return (
+                    f"用法：{cmd('预警 加时段 07:00-23:00')}　或　"
+                    f"{cmd('预警 加时段 工作日 08:00-18:00')}"
+                )
+            window = self._parse_window(rest)
             windows = list(cfg.get("windows") or []) + [window]
             await self._store.patch_section(umo, lid, "alert", {"windows": windows})
-            return f"✅ 已添加时段 {window['start']}-{window['end']}"
+            return f"✅ 已添加时段 {schedule.window_text([window])}"
 
         if head in ("删时段", "删"):
             if not rest or not rest[0].isdigit():
@@ -782,9 +809,93 @@ class Commands:
                 f"可提醒时段：{schedule.window_text(cfg.get('windows') or [])}",
                 f"等级升高再推：{'开' if cfg.get('notify_on_upgrade') else '关'}",
                 "",
-                "本指令后接：间隔 60｜等级 橙｜升级 开｜加时段 07:00-23:00｜删时段 1｜测试",
+                "本指令后接：间隔 60｜等级 橙｜升级 开｜加时段 07:00-23:00",
+                "　　　　　加时段 工作日 08:00-18:00｜删时段 1｜测试",
             ]
         )
+
+    # ================================================================ 工作日
+
+    async def handle_workday(self, umo: str, args: list[str]) -> str:  # noqa: ARG002
+        if self._calendar is None:
+            return "工作日日历不可用（插件还没初始化完）。"
+        today = date.today()
+        head = (args[0] if args else "").strip()
+
+        if head in ("帮助", "help", "?", "？"):
+            return workday_help()
+        if head in ("刷新", "更新", "下拉", "refresh", "拉取"):
+            events = await self._calendar.maintain(datetime.now(), startup=True)
+            body = "；".join(events) if events else "已是最新，没有要补的数据"
+            return f"✅ {body}\n\n" + self._workday_view(today, today)
+        if head in ("状态", "数据", "status"):
+            return self._workday_status(today)
+
+        target = today
+        if head:
+            parsed = _parse_day_text(head, today)
+            if parsed is None:
+                return f"日期写法不认识：{head}（用 2026-11-01、11-01、明天、后天）"
+            target = parsed
+        return self._workday_view(target, today)
+
+    def _workday_view(self, day: date, today: date) -> str:
+        cal = self._calendar
+        assert cal is not None
+        work = cal.is_workday(day)
+        weekday = "一二三四五六日"[day.weekday()]
+        lines = [
+            f"{day.isoformat()}（周{weekday}）：{'工作日' if work else '休息日'}"
+            f"（{cal.day_note(day)}）"
+        ]
+        if day == today:
+            nxt_work = cal.next_workday(day)
+            nxt_rest = cal.next_rest(day)
+            if nxt_work:
+                lines.append(f"下个工作日：{_fmt_day(nxt_work)}")
+            if nxt_rest:
+                lines.append(f"下个休息日：{_fmt_day(nxt_rest)}")
+            lines.append(f"本月剩余工作日：{self._rest_of_month(day)} 天（含今天）")
+        lines.append("")
+        lines.append(cal.status_line(day.year))
+        if not cal.has_data(day.year):
+            lines.append("数据没到之前，节假日只能按周一至周五估算。")
+        return "\n".join(lines)
+
+    def _rest_of_month(self, day: date) -> int:
+        cal = self._calendar
+        if cal is None:
+            return 0
+        last = date(day.year, day.month, schedule.month_days(day.year, day.month))
+        count = 0
+        cursor = day
+        while cursor <= last:
+            if cal.is_workday(cursor):
+                count += 1
+            cursor += timedelta(days=1)
+        return count
+
+    def _workday_status(self, today: date) -> str:
+        cal = self._calendar
+        assert cal is not None
+        lines = ["工作日日历：", f"  轮换设置：{cal.schedule_text()}"]
+        years = cal.years()
+        if not years:
+            lines.append("  还没有任何年份的数据。")
+        for year in years:
+            item = cal.year_data(year)
+            state = "已就绪" if cal.has_data(year) else "未就绪"
+            holidays = len(item.get("holidays") or {})
+            makeup = len(item.get("makeup") or {})
+            weekends = len(item.get("weekends") or [])
+            rests = len(item.get("rests") or {})
+            got = (item.get("fetched_at") or "-")[:10]
+            lines.append(
+                f"  {year}：{state}｜放假 {holidays} 天、调休上班 {makeup} 天｜"
+                f"周末 {weekends} 天、实际休息 {rests} 天｜抓取 {got}"
+            )
+        lines.append(f"  今天：{today.isoformat()}（{cal.day_note(today)}）")
+        return "\n".join(lines)
 
     # ================================================================ key
 
@@ -863,71 +974,190 @@ class Commands:
             client = await self._client(umo)
         except QWeatherError as exc:
             return f"❌ {exc}"
+        return await quota.build_report(client, key_note=await self._key_note(umo))
 
-        lines: list[str] = []
-        errors: list[str] = []
+    async def _key_note(self, umo: str) -> str:
+        """这次用的是哪套 key。额度推送必须说清楚，否则用户会疑惑「谁的余额」。"""
+        if self._keys is None:
+            return ""
+        resolved = await self._keys.resolve(umo)
+        if resolved is None:
+            return ""
+        return "本会话专用 key" if resolved.source == "session" else "系统默认 key"
 
-        try:
-            finance = await client.finance_summary()
-        except QWeatherError as exc:
-            finance = None
-            errors.append(f"财务汇总：{exc}")
+    # ================================================================ 额度推送
 
-        if finance:
-            as_of = (finance.get("asOf") or "")[:16].replace("T", " ")
-            currency = finance.get("currency") or ""
-            lines.append(f"账户余额：{finance.get('balance')} {currency}（数据截至 {as_of} UTC）")
-            charges = finance.get("accruedCharges") or {}
-            lines.append(
-                f"应计费用：本月 {charges.get('thisMonth', '-')}　"
-                f"昨日 {charges.get('previousDay', '-')}"
-            )
-            plans = finance.get("availableResourcePlans") or []
-            if plans:
-                for plan in plans[:3]:
-                    lines.append(
-                        f"资源包 {plan.get('billNumber')}：共 {plan.get('requests')} 次，"
-                        f"已用 {plan.get('utilized')}"
-                    )
-            else:
-                lines.append("资源包：无（免费订阅额度不在资源包里，看不到剩余量）")
-            bills = finance.get("pendingBills") or []
-            unpaid = [b for b in bills if b.get("status") == "unpaid"]
-            if unpaid:
-                lines.append(f"待付账单：{len(unpaid)} 笔")
+    async def handle_quota_push(self, umo: str, args: list[str]) -> str:
+        if args and args[0] in ("帮助", "help", "?", "？"):
+            return quota_push_help()
+        head = args[0] if args else ""
+        rest = args[1:]
+        if not head or head in ("列表", "ls", "list"):
+            return await self._list_quota_rules(umo)
+        if head in ("加", "添加", "add"):
+            return await self._add_quota_rule(umo, rest)
+        if head in ("改", "修改", "edit"):
+            return await self._edit_quota_rule(umo, rest)
+        if head in ("开", "启用", "on"):
+            return await self._toggle_quota_rule(umo, rest, True)
+        if head in ("关", "关闭", "停用", "off"):
+            return await self._toggle_quota_rule(umo, rest, False)
+        if head in ("删", "删除", "del"):
+            return await self._delete_quota_rule(umo, rest)
+        if head in ("试", "测试", "test"):
+            return await self._try_quota_rule(umo, rest)
+        return quota_push_help()
 
-        try:
-            stats = await client.metrics_stats()
-        except QWeatherError as exc:
-            stats = None
-            errors.append(f"请求量统计：{exc}")
-
-        if stats:
-            as_of = (stats.get("asOf") or "")[:16].replace("T", " ")
-            success = stats.get("success") or []
-            failure = stats.get("errors") or []
-            total_ok = sum(sum(item.get("hours") or []) for item in success)
-            total_err = sum(sum(item.get("hours") or []) for item in failure)
+    async def _list_quota_rules(self, umo: str) -> str:
+        rules = await self._store.quota_rules(umo)
+        note = await self._key_note(umo)
+        head = f"额度推送（凭据：{note}）" if note else "额度推送"
+        lines = [head, ""]
+        if not rules:
+            lines.append("还没有额度推送规则。")
             lines.append("")
-            lines.append(
-                f"最近 24 小时（截至 {as_of} UTC）：成功 {total_ok} 次，失败 {total_err} 次"
-            )
-            for item in sorted(success, key=lambda x: -sum(x.get("hours") or []))[:6]:
-                count = sum(item.get("hours") or [])
-                if count:
-                    lines.append(f"  {item.get('api')}：{count}")
+            lines.append(quota_push_help())
+            return "\n".join(lines)
+        for idx, rule in enumerate(rules, 1):
+            lines.append(schedule.describe_rule(rule, idx))
+        lines.append("")
+        lines.append("开/关/删/改/试 后面跟序号。推送内容就是「额度」那份报告。")
+        return "\n".join(lines)
 
-        if errors:
-            lines.append("")
-            lines.append("⚠️ 以下接口未取到：")
-            lines.extend(f"  {e}" for e in errors)
-            if any("403" in e for e in errors):
-                lines.append(
-                    "\n控制台 API 默认关闭。去「控制台 → 项目管理 → 点开凭据 → 下滑到控制台权限」，"
-                    "勾选「允许访问财务汇总数据」和「允许访问请求量统计」，保存后再试。"
-                )
+    async def _add_quota_rule(self, umo: str, rest: list[str]) -> str:
+        try:
+            rule = parse_rule(rest, with_content=False, allow_solar=False)
+        except ValueError as exc:
+            return f"❌ {exc}\n\n{quota_push_help()}"
+        saved = await self._store.add_quota_rule(umo, rule)
+        if saved is None:
+            return "❌ 保存失败，稍后再试。"
+        rules = await self._store.quota_rules(umo)
+        idx = next((i for i, r in enumerate(rules, 1) if r.get("id") == saved.get("id")), 0)
+        lines = [f"✅ 已添加额度推送规则 {idx}", schedule.describe_rule(saved)]
+        preview = self._preview_quota(saved)
+        if preview:
+            lines.append(f"下次触发：{preview}")
+        note = await self._key_note(umo)
+        if note:
+            lines.append(f"推送时用：{note}（本会话设过专用 key 就用专用 key）")
+        return "\n".join(lines)
 
-        return "\n".join(lines) if lines else "没取到任何数据。"
+    async def _edit_quota_rule(self, umo: str, rest: list[str]) -> str:
+        if not rest:
+            return f"用法：{cmd('额度推送 改 1 时间=10:00')}"
+        rule = await self._store.find_quota_rule(umo, rest[0])
+        if not rule:
+            return f"没找到规则 {rest[0]}，发「{cmd('额度推送')}」看列表。"
+        _, kv = _kv_split(rest[1:])
+        patch: dict[str, Any] = {}
+        try:
+            if "时间" in kv:
+                patch["at"] = schedule.fmt_clock(*schedule.parse_clock(kv["时间"]))
+            if "日" in kv:
+                patch["days"] = schedule.parse_days(kv["日"])
+            if "标题" in kv:
+                patch["title"] = kv["标题"][:20]
+        except ValueError as exc:
+            return f"❌ {exc}"
+        if not patch:
+            return "没看出要改什么。支持：时间= 日= 标题="
+        updated = await self._store.update_quota_rule(umo, rule["id"], patch)
+        return f"✅ 已更新\n{schedule.describe_rule(updated or rule)}"
+
+    async def _toggle_quota_rule(self, umo: str, rest: list[str], enabled: bool) -> str:
+        if not rest:
+            return f"用法：{cmd('额度推送 开 1')}"
+        rule = await self._store.find_quota_rule(umo, rest[0])
+        if not rule:
+            return f"没找到规则 {rest[0]}。"
+        updated = await self._store.update_quota_rule(umo, rule["id"], {"enabled": enabled})
+        return (
+            f"{'✅ 已开启' if enabled else '⏸ 已关闭'}\n{schedule.describe_rule(updated or rule)}"
+        )
+
+    async def _delete_quota_rule(self, umo: str, rest: list[str]) -> str:
+        if not rest:
+            return f"用法：{cmd('额度推送 删 1')}"
+        rule = await self._store.find_quota_rule(umo, rest[0])
+        if not rule:
+            return f"没找到规则 {rest[0]}。"
+        await self._store.delete_quota_rule(umo, rule["id"])
+        return f"🗑 已删除\n{schedule.describe_rule(rule)}"
+
+    async def _try_quota_rule(self, umo: str, rest: list[str]) -> str:
+        if rest:
+            rule = await self._store.find_quota_rule(umo, rest[0])
+            if not rule:
+                return f"没找到规则 {rest[0]}。"
+        try:
+            client = await self._client(umo)
+        except QWeatherError as exc:
+            return f"❌ {exc}"
+        text = await quota.build_report(client, key_note=await self._key_note(umo))
+        return "（预览，不发到频道）\n" + text
+
+    def _preview_quota(self, rule: dict[str, Any]) -> str:
+        runs = schedule.next_runs(
+            rule, datetime.now(), None, limit=1, horizon_days=400, day_filter=self._day_filter()
+        )
+        return runs[0].strftime("%m-%d %H:%M") if runs else ""
+
+    def _day_filter(self):
+        return self._calendar.is_workday if self._calendar is not None else None
+
+
+def quota_push_help() -> str:
+    return f"""额度推送（查当前会话的余额与 24 小时请求量，按固定时间推）：
+{cmd("额度推送")}　　　　　　　列出规则
+{cmd("额度推送 加 每天 09:00")}
+{cmd("额度推送 加 每周 一 09:00")}
+{cmd("额度推送 加 每月 1 09:00 日=工作日")}
+{cmd("额度推送 改 1 时间=10:00")}
+{cmd("额度推送 开 1")}　关 1　删 1　试 1
+
+用哪套 key：本会话设过专用 key 就用它，没设就用插件配置里的系统默认 key。
+日条件可选：日=工作日 / 日=休息日，不写就是每天。"""
+
+
+def _fmt_day(day: date) -> str:
+    weekday = "一二三四五六日"[day.weekday()]
+    return f"{day.isoformat()}（周{weekday}）"
+
+
+def _parse_day_text(text: str, today: date) -> date | None:
+    """``明天`` / ``11-01`` / ``2027-01-01`` → 日期。认不出来返回 None。"""
+    raw = (text or "").strip().replace("/", "-").replace(".", "-")
+    aliases = {"今天": 0, "今日": 0, "明天": 1, "明日": 1, "后天": 2}
+    if raw in aliases:
+        return today + timedelta(days=aliases[raw])
+    match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            return None
+    match = re.fullmatch(r"(\d{1,2})-(\d{1,2})", raw)
+    if match:
+        try:
+            return date(today.year, int(match.group(1)), int(match.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+def workday_help() -> str:
+    return f"""工作日（含法定节假日与调休）：
+{cmd("工作日")}　　　　　　　今天是不是工作日
+{cmd("工作日 明天")}　　　　看明天（也可以写 后天 / 11-01 / 2027-01-01）
+{cmd("工作日 状态")}　　　　各年数据状态与轮换日期
+{cmd("工作日 刷新")}　　　　立刻检查一次当年 / 次年数据
+
+数据每年 11 月 1 日起每天 0 点自动抓次年安排，抓到就停；每年 2 月 1 日清理旧年份。
+这三个日期都能在插件配置里改：
+  next_year_fetch_date　　次年数据开始尝试的日期（默认 11-01）
+  next_year_calendar_date 次年周末日历生成日（默认 11-01）
+  cleanup_date　　　　　　清理旧年份的日期（默认 02-01）"""
 
 
 # 供 main.py 判断某条消息是不是在等用户补输入

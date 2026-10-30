@@ -17,6 +17,24 @@
     "hint": "所有指令都挂在它下面，写法是「/前缀 天气」。默认 qweather；留空、只填空格或只填「/」都会自动回落成 qweather——不允许无前缀，否则 /天气 这类裸指令会和别的天气插件撞名（两个插件同时回一条消息）。改完到插件页点一次重载才生效。",
     "default": "qweather"
   },
+  "next_year_fetch_date": {
+    "type": "string",
+    "description": "次年节假日数据开始抓取的日期",
+    "hint": "默认 11-01。从这天起每天 0:00 试着拉次年的放假与调休安排，拿到就永久停手；没拿到第二天再试。插件加载时如果已经过了这天，会立刻补一次，不用等第二天。格式 MM-DD。",
+    "default": "11-01"
+  },
+  "next_year_calendar_date": {
+    "type": "string",
+    "description": "次年周末日历生成日期",
+    "hint": "默认 11-01。到这天算一次次年的全部周六周日，纯本地计算、不联网。格式 MM-DD。",
+    "default": "11-01"
+  },
+  "cleanup_date": {
+    "type": "string",
+    "description": "清理旧年份数据的日期",
+    "hint": "默认 02-01。到这天删掉更早年份的节假日数据，避免 workdays.json 越攒越大。当前年和次年永远保留（判断「今天是不是工作日」要用）。格式 MM-DD。",
+    "default": "02-01"
+  },
   "iss": {
     "type": "string",
     "description": "系统默认 key - 开发者 ID（iss）",

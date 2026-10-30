@@ -48,7 +48,8 @@ MAX_LOCATIONS = 20  # 每个会话最多几个地址。再多就该考虑是不�
 
 DEFAULT_PRECIP: dict[str, Any] = {
     "enabled": False,
-    "windows": [{"start": "07:00", "end": "23:00"}],
+    # days: all / workday / restday，只在对应日子生效（工作日判断见 qw.workday）
+    "windows": [{"start": "07:00", "end": "23:00", "days": "all"}],
     "on_start": True,
     "on_stop": True,
     "lead_minutes": 60,
@@ -59,7 +60,7 @@ DEFAULT_ALERT: dict[str, Any] = {
     "enabled": False,
     "poll_interval": 60,
     "min_level": "yellow",
-    "windows": [{"start": "07:00", "end": "23:00"}],
+    "windows": [{"start": "07:00", "end": "23:00", "days": "all"}],
     "notify_on_upgrade": True,
 }
 
@@ -74,6 +75,22 @@ DEFAULT_RULE: dict[str, Any] = {
     "solar": "sunrise",
     "offset": 0,
     "content": ["now", "daily"],
+    "days": "all",
+    "title": "",
+}
+
+# 额度推送的规则：触发方式与天气规则同一套，但没有「内容」可选——额度报告永远是那一份。
+DEFAULT_QUOTA_RULE: dict[str, Any] = {
+    "kind": "clock",
+    "enabled": True,
+    "at": "09:00",
+    "weekdays": [],
+    "monthdays": [],
+    "hours": [],
+    "minutes": [0],
+    "solar": "sunrise",
+    "offset": 0,
+    "days": "all",
     "title": "",
 }
 
@@ -133,8 +150,30 @@ def blank_location(city: dict[str, Any] | None = None, name: str = "") -> dict[s
     }
 
 
+def blank_quota() -> dict[str, Any]:
+    return {"rules": [], "state": {"fired": {}}}
+
+
 def blank_session() -> dict[str, Any]:
-    return {"active": "", "locations": []}
+    # 额度是「按会话」的，不挂在地址上：一个会话一套 key，余额和请求量也只跟这套 key 有关
+    return {"active": "", "locations": [], "quota": blank_quota()}
+
+
+def normalize_windows(value: Any) -> list[dict[str, str]]:
+    """把时段列表洗成统一结构，顺带兼容没有 ``days`` 字段的老数据。"""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        start = str(item.get("start") or "").strip()
+        end = str(item.get("end") or "").strip()
+        if not start or not end:
+            continue
+        days = str(item.get("days") or "all").strip() or "all"
+        out.append({"start": start, "end": end, "days": days})
+    return out
 
 
 def normalize_city(city: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +193,18 @@ def normalize_city(city: dict[str, Any]) -> dict[str, Any]:
         # city / district：决定预警是按前缀匹配还是精确匹配，见 pushers。
         "level": "district" if city.get("coord") else str(city.get("level") or "city"),
     }
+
+
+def pick_rule(rules: list[dict[str, Any]], ref: str) -> dict[str, Any] | None:
+    """``ref`` 可以是 rule id，也可以是 1-based 序号。先按 id 找，再按序号。"""
+    by_id = next((r for r in rules if r.get("id") == ref), None)
+    if by_id is not None:
+        return by_id
+    if str(ref or "").isdigit():
+        idx = int(ref) - 1
+        if 0 <= idx < len(rules):
+            return rules[idx]
+    return None
 
 
 class SubStore:
@@ -198,6 +249,7 @@ class SubStore:
             return migrated
 
         base = blank_session()
+        base["quota"] = cls._repair_quota(session.get("quota"))
         for item in raw_locations:
             if not isinstance(item, dict):
                 continue
@@ -215,6 +267,7 @@ class SubStore:
     @classmethod
     def _migrate_v1(cls, session: dict[str, Any]) -> dict[str, Any]:
         base = blank_session()
+        base["quota"] = cls._repair_quota(session.get("quota"))
         city = session.get("city")
         if not isinstance(city, dict) or not city:
             return base
@@ -246,12 +299,34 @@ class SubStore:
         return base
 
     @staticmethod
-    def _repair_rule(item: dict[str, Any]) -> dict[str, Any]:
-        rule = dict(DEFAULT_RULE)
-        rule.update({k: v for k, v in item.items() if k in DEFAULT_RULE or k == "id"})
+    def _repair_rule(
+        item: dict[str, Any], defaults: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        template = defaults or DEFAULT_RULE
+        rule = dict(template)
+        rule.update({k: v for k, v in item.items() if k in template or k == "id"})
         if not rule.get("id"):
             rule["id"] = new_rule_id()
         return rule
+
+    @classmethod
+    def _repair_quota(cls, raw: Any) -> dict[str, Any]:
+        base = blank_quota()
+        if not isinstance(raw, dict):
+            return base
+        rules = raw.get("rules")
+        if isinstance(rules, list):
+            base["rules"] = [
+                cls._repair_rule(item, DEFAULT_QUOTA_RULE)
+                for item in rules
+                if isinstance(item, dict)
+            ]
+        state = raw.get("state")
+        if isinstance(state, dict) and isinstance(state.get("fired"), dict):
+            base["state"]["fired"] = {
+                str(k): str(v) for k, v in state["fired"].items() if isinstance(v, str)
+            }
+        return base
 
     @classmethod
     def _repair_location(cls, item: dict[str, Any]) -> dict[str, Any]:
@@ -267,6 +342,7 @@ class SubStore:
             if isinstance(cfg, dict):
                 merged = dict(defaults)
                 merged.update({k: v for k, v in cfg.items() if k in defaults})
+                merged["windows"] = normalize_windows(merged.get("windows"))
                 loc[section] = merged
         state = item.get("state")
         if isinstance(state, dict):
@@ -310,7 +386,12 @@ class SubStore:
         overflow = len(self._data) - MAX_SESSIONS
         if overflow <= 0:
             return
-        empties = [k for k, v in self._data.items() if not v.get("locations")]
+        # 空会话才回收：只配了额度推送、没有地址的会话不能误删
+        empties = [
+            k
+            for k, v in self._data.items()
+            if not v.get("locations") and not ((v.get("quota") or {}).get("rules"))
+        ]
         for key in empties[:overflow]:
             self._data.pop(key, None)
 
@@ -458,15 +539,7 @@ class SubStore:
 
     async def find_rule(self, umo: str, lid: str, ref: str) -> dict[str, Any] | None:
         """``ref`` 可以是 rule id，也可以是 1-based 序号。先按 id 找，再按序号。"""
-        rules = await self.list_rules(umo, lid)
-        by_id = next((r for r in rules if r.get("id") == ref), None)
-        if by_id is not None:
-            return by_id
-        if ref.isdigit():
-            idx = int(ref) - 1
-            if 0 <= idx < len(rules):
-                return rules[idx]
-        return None
+        return pick_rule(await self.list_rules(umo, lid), ref)
 
     async def update_rule(
         self, umo: str, lid: str, rule_id: str, patch: dict[str, Any]
@@ -502,6 +575,7 @@ class SubStore:
         loc = await self.location(umo, lid)
         merged = dict(defaults)
         merged.update((loc or {}).get(section) or {})
+        merged["windows"] = normalize_windows(merged.get("windows"))
         return merged
 
     async def patch_section(
@@ -558,6 +632,58 @@ class SubStore:
                 ordered = sorted(bucket.items(), key=lambda kv: str(kv[1].get("at", "")))
                 for key, _ in ordered[: len(bucket) - 50]:
                     bucket.pop(key, None)
+
+        await self._mutate(umo, _do)
+
+    # ---------------------------------------------------------------- 额度推送规则
+
+    async def quota(self, umo: str) -> dict[str, Any]:
+        item = await self.session(umo)
+        return _copy((item or {}).get("quota") or blank_quota())
+
+    async def quota_rules(self, umo: str) -> list[dict[str, Any]]:
+        return list((await self.quota(umo)).get("rules") or [])
+
+    async def add_quota_rule(self, umo: str, rule: dict[str, Any]) -> dict[str, Any] | None:
+        prepared = dict(DEFAULT_QUOTA_RULE)
+        prepared.update({k: v for k, v in rule.items() if k in DEFAULT_QUOTA_RULE})
+        prepared["id"] = new_rule_id()
+
+        def _do(item: dict[str, Any]) -> dict[str, Any]:
+            bucket = item.setdefault("quota", blank_quota())
+            bucket["rules"].append(prepared)
+            return dict(prepared)
+
+        return await self._mutate(umo, _do)
+
+    async def find_quota_rule(self, umo: str, ref: str) -> dict[str, Any] | None:
+        return pick_rule(await self.quota_rules(umo), ref)
+
+    async def update_quota_rule(
+        self, umo: str, rule_id: str, patch: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        def _do(item: dict[str, Any]) -> dict[str, Any] | None:
+            for rule in item.setdefault("quota", blank_quota())["rules"]:
+                if rule.get("id") == rule_id:
+                    rule.update(patch)
+                    return dict(rule)
+            return None
+
+        return await self._mutate(umo, _do)
+
+    async def delete_quota_rule(self, umo: str, rule_id: str) -> bool:
+        def _do(item: dict[str, Any]) -> bool:
+            bucket = item.setdefault("quota", blank_quota())
+            before = len(bucket["rules"])
+            bucket["rules"] = [r for r in bucket["rules"] if r.get("id") != rule_id]
+            bucket["state"]["fired"].pop(rule_id, None)
+            return len(bucket["rules"]) < before
+
+        return await self._mutate(umo, _do)
+
+    async def mark_quota_fired(self, umo: str, rule_id: str, stamp: str) -> None:
+        def _do(item: dict[str, Any]) -> None:
+            item.setdefault("quota", blank_quota())["state"]["fired"][rule_id] = stamp
 
         await self._mutate(umo, _do)
 

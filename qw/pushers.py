@@ -30,10 +30,11 @@ from typing import Any
 
 from astrbot.api import logger
 
-from . import render, schedule
+from . import quota, render, schedule
 from .client import QWeatherClient, QWeatherError
 from .keys import KeyStore
 from .store import SubStore, level_rank
+from .workday import WorkdayCalendar
 
 ClientFactory = Callable[[str], Awaitable[QWeatherClient]]
 Sender = Callable[[str, str], Awaitable[bool]]
@@ -90,11 +91,13 @@ class Pusher:
         keys: KeyStore,
         client_factory: ClientFactory,
         send: Sender,
+        calendar: WorkdayCalendar | None = None,
     ) -> None:
         self._store = store
         self._keys = keys
         self._client = client_factory
         self._send = send
+        self._calendar = calendar
         self._task: asyncio.Task | None = None
         self._running = False
 
@@ -139,11 +142,21 @@ class Pusher:
 
     async def _tick(self) -> None:
         now = datetime.now()
+        # 日历维护是后台任务：真正要联网抓数据时不会把这一轮推送卡住
+        if self._calendar is not None:
+            self._calendar.kick(now)
+        is_workday = self._is_workday(now.date())
+
         sessions = await self._store.all_sessions()
         if not sessions:
             return
 
         for umo, session in sessions.items():
+            # 额度推送按会话走，和地址无关
+            try:
+                await self._run_quota(umo, session, now, is_workday)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[和风天气] 额度推送失败（{umo}）：{type(exc).__name__}: {exc}")
             for loc in session.get("locations") or []:
                 city = loc.get("city") or {}
                 if not city.get("lat"):
@@ -151,16 +164,72 @@ class Pusher:
                 # 一个地址炸了不能连累同会话的其它地址
                 for runner in (self._run_rules, self._run_alerts, self._run_precip):
                     try:
-                        await runner(umo, loc, now)
+                        await runner(umo, loc, now, is_workday)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             f"[和风天气] {runner.__name__} 失败"
                             f"（{umo}/{loc.get('lid')}）：{type(exc).__name__}: {exc}"
                         )
 
+    def _is_workday(self, day) -> bool | None:
+        return self._calendar.is_workday(day) if self._calendar is not None else None
+
+    # ---------------------------------------------------------------- 额度推送
+
+    async def _run_quota(
+        self,
+        umo: str,
+        session: dict[str, Any],
+        now: datetime,
+        is_workday: bool | None = None,
+    ) -> None:
+        """额度规则是按会话存的，所以不跟着地址循环。
+
+        用哪套 key 完全交给 ``self._client``：它内部先查会话 key，没有再退回系统默认 key。
+        """
+        bucket = session.get("quota") or {}
+        rules = bucket.get("rules") or []
+        if not rules:
+            return
+        fired = (bucket.get("state") or {}).get("fired") or {}
+        stamp_now = now.strftime("%Y-%m-%d %H:%M")
+
+        for rule in rules:
+            if not rule.get("enabled", True):
+                continue
+            if not schedule.day_allowed(rule.get("days"), is_workday):
+                continue
+            stamp = schedule.target_stamp(rule, now, None)
+            if not stamp or stamp != stamp_now:
+                continue
+            if fired.get(rule.get("id")) == stamp:
+                continue
+            text = await self._quota_text(umo)
+            if not text:
+                continue
+            if await self._send(umo, text):
+                await self._store.mark_quota_fired(umo, rule["id"], stamp)
+
+    async def _quota_text(self, umo: str) -> str:
+        try:
+            client = await self._client(umo)
+        except QWeatherError as exc:
+            logger.warning(f"[和风天气] 额度推送取数失败：{exc}")
+            return ""
+        note = ""
+        try:
+            resolved = await self._keys.resolve(umo)
+            if resolved is not None:
+                note = "本会话专用 key" if resolved.source == "session" else "系统默认 key"
+        except Exception:  # noqa: BLE001 取不到就只是少一行说明
+            note = ""
+        return await quota.build_report(client, key_note=note)
+
     # ---------------------------------------------------------------- 定时规则
 
-    async def _run_rules(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+    async def _run_rules(
+        self, umo: str, loc: dict[str, Any], now: datetime, is_workday: bool | None = None
+    ) -> None:
         rules = loc.get("rules") or []
         if not rules:
             return
@@ -169,6 +238,9 @@ class Pusher:
 
         for rule in rules:
             if not rule.get("enabled", True):
+                continue
+            # 日条件先挡：省掉后面取数的钱，也避免在休息日把工作日报推出去
+            if not schedule.day_allowed(rule.get("days"), is_workday):
                 continue
             sun = None
             if rule.get("kind") == "solar":
@@ -262,11 +334,13 @@ class Pusher:
 
     # ---------------------------------------------------------------- 灾害预警
 
-    async def _run_alerts(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+    async def _run_alerts(
+        self, umo: str, loc: dict[str, Any], now: datetime, is_workday: bool | None = None
+    ) -> None:
         cfg = loc.get("alert") or {}
         if not cfg.get("enabled"):
             return
-        if not schedule.in_windows(now, cfg.get("windows") or []):
+        if not schedule.in_windows(now, cfg.get("windows") or [], is_workday):
             return
 
         lid = str(loc.get("lid") or "")
@@ -376,13 +450,15 @@ class Pusher:
 
     # ---------------------------------------------------------------- 雨雪提醒
 
-    async def _run_precip(self, umo: str, loc: dict[str, Any], now: datetime) -> None:
+    async def _run_precip(
+        self, umo: str, loc: dict[str, Any], now: datetime, is_workday: bool | None = None
+    ) -> None:
         cfg = loc.get("precip") or {}
         if not cfg.get("enabled"):
             return
         if not (cfg.get("on_start") or cfg.get("on_stop")):
             return
-        if not schedule.in_windows(now, cfg.get("windows") or []):
+        if not schedule.in_windows(now, cfg.get("windows") or [], is_workday):
             return
 
         lid = str(loc.get("lid") or "")

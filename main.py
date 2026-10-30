@@ -9,8 +9,10 @@
 ``/qweather 推送``　定时推送规则（每天、每周、每月、每小时、日出日落）
 ``/qweather 雨雪``　降水开始 / 结束提醒，可配多个可提醒时段
 ``/qweather 预警``　灾害预警轮询，同一条不重复推、等级升高再推
+``/qweather 工作日`` 今天 / 指定日期是不是工作日（含节假日与调休）
 ``/qweather key``　 本会话专用凭据（分步引导），可随时恢复系统默认
 ``/qweather 额度``　账户余额与最近 24 小时请求量
+``/qweather 额度推送`` 把额度报告按固定时间推送（本会话设过专用 key 就用专用 key）
 
 为什么不做无前缀指令
 --------------------
@@ -33,6 +35,7 @@ ProcessStage：LLM 只在 ``is_at_or_wake_command`` 为真且没有发送过消�
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +49,13 @@ from .qw.commands import Commands, join_place
 from .qw.keys import KeyStore, KeyWizard
 from .qw.pushers import Pusher
 from .qw.store import SubStore
+from .qw.workday import (
+    DEFAULT_CALENDAR_DATE,
+    DEFAULT_CLEANUP_DATE,
+    DEFAULT_FETCH_DATE,
+    WorkdayCalendar,
+    parse_month_day,
+)
 
 PLUGIN_NAME = "astrbot_plugin_qweather"
 
@@ -88,6 +98,13 @@ _SUB_ALIASES = {
     "余额": "_cmd_quota",
     "用量": "_cmd_quota",
     "quota": "_cmd_quota",
+    "额度推送": "_cmd_quota_push",
+    "额度订阅": "_cmd_quota_push",
+    "quota_push": "_cmd_quota_push",
+    "工作日": "_cmd_workday",
+    "上班日": "_cmd_workday",
+    "节假日": "_cmd_workday",
+    "workday": "_cmd_workday",
     "帮助": "_help_text",
     "help": "_help_text",
     "用法": "_help_text",
@@ -125,10 +142,15 @@ def help_text() -> str:
 {c("雨雪")}　　　　　　　降水开始 / 结束提醒
 {c("预警")}　　　　　　　灾害预警提醒
 　想指定别的地址，在命令里加「地址=2」
+　推送规则加「日=工作日」，就只在上班日推（调休上班算工作日）
+
+工具：
+{c("工作日")}　　　　　　今天 / 指定日期是不是工作日（含节假日与调休）
 
 配置：
 {c("key")}　　　　　　　 查看凭据（支持本会话专用 key）
-{c("额度")}　　　　　　　余额与请求量"""
+{c("额度")}　　　　　　　余额与请求量
+{c("额度推送")}　　　　　把额度报告按固定时间推送（用本会话的 key）"""
 
 
 class QWeatherPlugin(Star):
@@ -149,10 +171,25 @@ class QWeatherPlugin(Star):
             default_pem=self._cfg_str("private_key"),
         )
         self._wizard = KeyWizard(timeout=300)
-        self._commands = Commands(
-            self._subs, self._keys, self._wizard, self._client_for, self._resolve_place
+        # 工作日日历：节假日 / 调休落盘到 workdays.json，按配置的三个日期自动轮换
+        self._calendar = WorkdayCalendar(
+            data_dir / "workdays.json",
+            fetch_date=parse_month_day(self._cfg_str("next_year_fetch_date"), DEFAULT_FETCH_DATE),
+            calendar_date=parse_month_day(
+                self._cfg_str("next_year_calendar_date"), DEFAULT_CALENDAR_DATE
+            ),
+            cleanup_date=parse_month_day(self._cfg_str("cleanup_date"), DEFAULT_CLEANUP_DATE),
+            timeout=self._cfg_float("http_timeout", 12.0),
         )
-        self._pusher = Pusher(self._subs, self._keys, self._client_for, self._send)
+        self._commands = Commands(
+            self._subs,
+            self._keys,
+            self._wizard,
+            self._client_for,
+            self._resolve_place,
+            self._calendar,
+        )
+        self._pusher = Pusher(self._subs, self._keys, self._client_for, self._send, self._calendar)
 
         self._clients: dict[str, QWeatherClient] = {}
         self._pending_city: dict[str, float] = {}
@@ -162,13 +199,23 @@ class QWeatherPlugin(Star):
     async def initialize(self) -> None:
         await self._subs.load()
         await self._keys.load()
+        await self._calendar.load()
+        # 启动时补一次：当年缺数据要拉，过了 11-01 还要顺手把次年的拉下来。
+        # 后台跑，不阻塞 AstrBot 启动。
+        self._calendar.kick(datetime.now(), startup=True)
+
         sessions = await self._subs.all_sessions()
         locations = [loc for s in sessions.values() for loc in s.get("locations") or []]
         rules = sum(len(loc.get("rules") or []) for loc in locations)
+        quota_rules = sum(len((s.get("quota") or {}).get("rules") or []) for s in sessions.values())
         key_state = "就绪" if self._keys.default_ready else f"未配置（{self._keys.default_error}）"
+        today = datetime.now().date()
+        calendar_state = "已就绪" if self._calendar.has_data(today.year) else "待抓取"
         logger.info(
             f"[和风天气] 已启动：{len(locations)} 个地址（{len(sessions)} 个会话），"
-            f"共 {rules} 条推送规则；系统默认 key {key_state}；指令前缀 /{self._prefix}"
+            f"共 {rules} 条推送规则、{quota_rules} 条额度推送；"
+            f"系统默认 key {key_state}；指令前缀 /{self._prefix}；"
+            f"{today.year} 年工作日数据 {calendar_state}"
         )
         if self._cfg_bool("push_enabled", True):
             self._pusher.start()
@@ -334,8 +381,17 @@ class QWeatherPlugin(Star):
         text, _need_input = await self._commands.handle_key(umo, args)
         return text
 
-    async def _cmd_quota(self, umo: str, args: list[str]) -> str:  # noqa: ARG002
+    async def _cmd_quota(self, umo: str, args: list[str]) -> str:
+        # 「/qweather 额度 推送 ...」与「/qweather 额度推送 ...」等价，两种写法都认
+        if args and args[0].lower() in ("推送", "订阅", "push"):
+            return await self._commands.handle_quota_push(umo, args[1:])
         return await self._commands.handle_quota(umo)
+
+    async def _cmd_quota_push(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_quota_push(umo, args)
+
+    async def _cmd_workday(self, umo: str, args: list[str]) -> str:
+        return await self._commands.handle_workday(umo, args)
 
     # ---------------------------------------------------------------- 天气实现
 

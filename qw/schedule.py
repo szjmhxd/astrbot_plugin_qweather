@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import calendar
 import re
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -82,6 +83,29 @@ CONTENT_LABEL = {
     "alert": "预警",
     "sun": "日出日落",
     "minutely": "降水",
+}
+
+# 「日」条件：规则和可提醒时段都能限定只在工作日或只在休息日生效。
+# 判定要用 qw.workday 的日历（节假日 + 调休），这里只管写法和语义。
+DAY_LABEL = {"all": "不限", "workday": "仅工作日", "restday": "仅休息日"}
+
+DAY_ALIAS = {
+    "全部": "all",
+    "不限": "all",
+    "每天": "all",
+    "all": "all",
+    "any": "all",
+    "工作日": "workday",
+    "仅工作日": "workday",
+    "上班日": "workday",
+    "workday": "workday",
+    "weekday": "workday",
+    "休息日": "restday",
+    "仅休息日": "restday",
+    "周末": "restday",
+    "节假日": "restday",
+    "restday": "restday",
+    "weekend": "restday",
 }
 
 
@@ -198,6 +222,70 @@ def parse_content(text: str) -> list[str]:
     return ordered
 
 
+def parse_days(text: str) -> str:
+    """``工作日`` / ``休息日`` / ``不限`` → ``"workday"`` / ``"restday"`` / ``"all"``。"""
+    key = (text or "").strip()
+    if key in DAY_ALIAS:
+        return DAY_ALIAS[key]
+    raise ValueError(f"日条件不认识：{text}（用 工作日 / 休息日 / 不限）")
+
+
+def normalize_days(value: object) -> str:
+    """读配置时用：认不出的一律当 ``all``，避免脏数据把推送整条挡掉。"""
+    key = str(value or "").strip()
+    return DAY_ALIAS.get(key, "all")
+
+
+def day_allowed(mode: object, is_workday: bool | None) -> bool:
+    """这条规则 / 这个时段在今天就该不该生效。
+
+    ``is_workday`` 为 ``None`` 表示调用方拿不到日历（数据没就绪）。带日条件的规则这时
+    按「不满足」处理——宁可少推一次，也不要在休息日早上把工作日报推给用户。
+    """
+    normalized = normalize_days(mode)
+    if normalized == "all":
+        return True
+    if is_workday is None:
+        return False
+    return is_workday if normalized == "workday" else not is_workday
+
+
+def parse_window(tokens: list[str]) -> dict[str, str]:
+    """``["工作日", "08:00-12:00"]`` → ``{"start","end","days"}``。
+
+    时间范围必填，日条件可选（默认 ``all``）。这样 ``加时段 08:00-12:00`` 的老写法照旧能用。
+    """
+    days = "all"
+    span = ""
+    # 长词优先：「工作日」要排在「日」这类短别名前面
+    words = sorted(DAY_ALIAS, key=len, reverse=True)
+    for token in tokens:
+        key = (token or "").strip()
+        if not key:
+            continue
+        if key in DAY_ALIAS:
+            days = DAY_ALIAS[key]
+            continue
+        # 兼容「工作日08:00-18:00」这种没打空格的写法
+        glued = next((w for w in words if key.startswith(w) and len(key) > len(w)), "")
+        if glued:
+            days = DAY_ALIAS[glued]
+            key = key[len(glued) :].strip(" :：,，")
+        if any(ch in key for ch in ("-", "—", "~", "到")):
+            span = key
+            continue
+        raise ValueError(f"时段写法不认识：{key}（用 08:00-12:00，或加前缀「工作日 08:00-12:00」）")
+    if not span:
+        raise ValueError("缺少时间范围，例如：08:00-12:00")
+    raw = span.replace("~", "-").replace("到", "-")
+    parts = [p for p in re.split(r"[-—]", raw) if p.strip()]
+    if len(parts) != 2:
+        raise ValueError("时段格式：08:00-12:00")
+    start = fmt_clock(*parse_clock(parts[0]))
+    end = fmt_clock(*parse_clock(parts[1]))
+    return {"start": start, "end": end, "days": days}
+
+
 # ---------------------------------------------------------------- 判定
 
 
@@ -306,13 +394,18 @@ def next_runs(
     sun: dict[str, str] | None,
     limit: int = 3,
     horizon_days: int = 40,
+    day_filter: Callable[[date], bool] | None = None,
 ) -> list[datetime]:
-    """往后推下一次（几次）触发时间，给用户看配置效果用。"""
+    """往后推下一次（几次）触发时间，给用户看配置效果用。
+
+    ``day_filter`` 传日历的 ``is_workday``，这样「仅工作日」的规则不会把下次触发算到周六。
+    """
     if not rule.get("enabled", True):
         return []
     out: list[datetime] = []
     kind = rule.get("kind") or "clock"
     cursor = now.replace(second=0, microsecond=0)
+    mode = normalize_days(rule.get("days"))
 
     if kind == "solar":
         moment = solar_target(rule, now, sun)
@@ -329,6 +422,9 @@ def next_runs(
         cursor += timedelta(minutes=1)
         if cursor.date() > now.date() + timedelta(days=horizon_days):
             break
+        if mode != "all" and day_filter is not None:
+            if not day_allowed(mode, day_filter(cursor.date())):
+                continue
         stamp = target_stamp(rule, cursor, sun)
         if stamp and stamp == cursor.strftime("%Y-%m-%d %H:%M"):
             out.append(cursor)
@@ -340,12 +436,20 @@ def next_runs(
 # ---------------------------------------------------------------- 时段
 
 
-def in_windows(now: datetime, windows: list[dict[str, str]]) -> bool:
-    """判断当前时刻是否落在任一可提醒时段内。时段支持跨零点（22:00-06:00）。"""
+def in_windows(
+    now: datetime, windows: list[dict[str, Any]], is_workday: bool | None = None
+) -> bool:
+    """判断当前时刻是否落在任一可提醒时段内。
+
+    时段支持跨零点（22:00-06:00），也可以限定「只在工作日」或「只在休息日」。
+    空列表等于不限制（全天可提醒）。
+    """
     if not windows:
         return True
     current = now.hour * 60 + now.minute
     for window in windows:
+        if not day_allowed(window.get("days"), is_workday):
+            continue
         try:
             start_h, start_m = parse_clock(window.get("start") or "00:00")
             end_h, end_m = parse_clock(window.get("end") or "23:59")
@@ -362,10 +466,15 @@ def in_windows(now: datetime, windows: list[dict[str, str]]) -> bool:
     return False
 
 
-def window_text(windows: list[dict[str, str]]) -> str:
+def window_text(windows: list[dict[str, Any]]) -> str:
     if not windows:
         return "全天"
-    return "、".join(f"{w.get('start', '?')}-{w.get('end', '?')}" for w in windows)
+    parts: list[str] = []
+    for window in windows:
+        mode = normalize_days(window.get("days"))
+        prefix = "" if mode == "all" else f"{DAY_LABEL[mode]} "
+        parts.append(f"{prefix}{window.get('start', '?')}-{window.get('end', '?')}")
+    return "、".join(parts)
 
 
 # ---------------------------------------------------------------- 摘要
@@ -399,7 +508,10 @@ def describe_rule(rule: dict[str, Any], idx: int | None = None) -> str:
         when = kind
 
     content = "+".join(CONTENT_LABEL.get(c, c) for c in rule.get("content") or [])
-    return f"{head}{flag}{when}｜{content}{title}"
+    mode = normalize_days(rule.get("days"))
+    day_tag = "" if mode == "all" else f"〔{DAY_LABEL[mode]}〕"
+    head_line = f"{head}{flag}{when}{day_tag}"
+    return f"{head_line}｜{content}{title}" if content else f"{head_line}{title}"
 
 
 def month_days(year: int, month: int) -> int:

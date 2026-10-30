@@ -16,7 +16,7 @@ import asyncio
 import json
 import sys
 import types
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 # 仓库根目录本身就是一个 Python 包（目录名 astrbot_plugin_qweather），
@@ -865,7 +865,296 @@ def test_pusher() -> None:
     asyncio.run(run())
 
 
-# ---------------------------------------------------------------- 6. 凭据与引导
+# ---------------------------------------------------------------- 5.5 工作日日历
+
+
+def test_workday() -> None:
+    section("工作日日历：节假日 / 调休 / 逐年轮换 / 清理")
+
+    from astrbot_plugin_qweather.qw.workday import WorkdayCalendar, parse_month_day
+
+    check("11-1 解析成 (11,1)", parse_month_day("11-1", (2, 1)) == (11, 1))
+    check("11月1日 也能解析", parse_month_day("11月1日", (2, 1)) == (11, 1))
+    check("越界回落默认值", parse_month_day("13-40", (2, 1)) == (2, 1))
+    check("空值回落默认值", parse_month_day("", (2, 1)) == (2, 1))
+
+    fixture = {
+        "year": 2026,
+        "days": [
+            {"name": "元旦", "date": "2026-01-01", "isOffDay": True},
+            {"name": "元旦", "date": "2026-01-02", "isOffDay": True},
+            {"name": "元旦", "date": "2026-01-03", "isOffDay": True},
+            {"name": "元旦", "date": "2026-01-04", "isOffDay": False},
+            {"name": "国庆节", "date": "2026-10-01", "isOffDay": True},
+            {"name": "国庆节", "date": "2026-10-10", "isOffDay": False},
+        ],
+    }
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "workdays_test.json"
+        if path.exists():
+            path.unlink()
+        cal = WorkdayCalendar(path)
+        calls: list[int] = []
+
+        async def fake_get_json(url: str):
+            year = int(url.rsplit("/", 1)[-1].split(".")[0])
+            calls.append(year)
+            # 2027 的 JSON 是「存在但 days 为空」，等同于还没公布
+            return fixture if year == 2026 else {"year": year, "days": []}
+
+        cal._get_json = fake_get_json  # type: ignore[method-assign]
+        await cal.load()
+
+        events = await cal.maintain(datetime(2026, 3, 15, 9, 0), startup=True)
+        check("加载时抓到当年数据", cal.has_data(2026), str(events))
+        check("当年周末日历生成了 104 天", len(cal.year_data(2026)["weekends"]) == 104)
+        check("元旦放假算休息日", not cal.is_workday(date(2026, 1, 1)))
+        check("调休上班的周日算工作日", cal.is_workday(date(2026, 1, 4)))
+        check("普通周六算休息日", not cal.is_workday(date(2026, 10, 31)))
+        check("普通周五算工作日", cal.is_workday(date(2026, 10, 30)))
+        check("国庆调休的周六算工作日", cal.is_workday(date(2026, 10, 10)))
+        check("3 月还没到窗口，不抓次年", not cal.has_data(2027))
+        check("次年日历也还没生成", cal.year_data(2027)["weekends"] == [])
+        check("没到 11-01 不会碰次年接口", 2027 not in calls, str(calls))
+
+        # 11-01：开始每天试一次，同时生成次年周末日历
+        calls.clear()
+        events = await cal.maintain(datetime(2026, 11, 1, 0, 0))
+        check("11-01 开始尝试次年数据", calls == [2027], str(calls))
+        check("11-01 生成次年周末日历", len(cal.year_data(2027)["weekends"]) == 104)
+        check("没公布时不算成功", not cal.has_data(2027))
+        check("事件里说清「明天再试」", any("明天再试" in e for e in events), str(events))
+
+        # 同一天再 tick 不能反复打接口
+        calls.clear()
+        await cal.maintain(datetime(2026, 11, 1, 0, 30))
+        check("同一天只尝试一次", calls == [], str(calls))
+        calls.clear()
+        await cal.maintain(datetime(2026, 11, 2, 0, 0))
+        check("第二天再试一次", calls == [2027], str(calls))
+
+        # 落盘：换实例重读，判断结果不变
+        cal2 = WorkdayCalendar(path)
+        await cal2.load()
+        check("重启后照样能判断调休", cal2.is_workday(date(2026, 1, 4)))
+        check("重启后当年数据仍在", cal2.has_data(2026))
+
+        # 次年真拿到数据后就不再请求
+        cal._years[2027] = cal._blank(2027)
+        cal._years[2027].update(
+            {"status": "ready", "holidays": {"2027-01-01": "元旦"}, "makeup": {}}
+        )
+        calls.clear()
+        await cal.maintain(datetime(2026, 11, 3, 0, 0))
+        check("已有次年数据就不再请求", calls == [], str(calls))
+
+        # 清理：2027-02-01 删掉 2026 及更早，保留当前年与次年
+        cal._years[2025] = cal._blank(2025)
+        cal._years[2025]["weekends"] = ["2025-01-04"]
+        await cal.maintain(datetime(2027, 2, 1, 0, 0))
+        check("清理掉旧年份", 2026 not in cal.years() and 2025 not in cal.years(), str(cal.years()))
+        check("当前年保留", 2027 in cal.years())
+
+        # 清理日之前不删
+        cal3 = WorkdayCalendar(path, cleanup_date=(2, 1))
+        await cal3.load()
+        cal3._years[2025] = cal3._blank(2025)
+        await cal3.maintain(datetime(2027, 1, 20, 0, 0))
+        check("没到清理日不删", 2025 in cal3.years())
+
+        check(
+            "状态行能说人话",
+            "未就绪" in cal3.status_line(2030) or "已就绪" in cal3.status_line(2030),
+        )
+        check("轮换配置能回显", "11-01" in cal3.schedule_text() and "02-01" in cal3.schedule_text())
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 5.6 日条件与额度推送
+
+
+def test_day_rules() -> None:
+    section("日条件：规则与可提醒时段")
+
+    from astrbot_plugin_qweather.qw import schedule
+    from astrbot_plugin_qweather.qw.commands import parse_rule
+
+    check("工作日写法", schedule.parse_days("工作日") == "workday")
+    check("休息日写法", schedule.parse_days("休息日") == "restday")
+    check("不限写法", schedule.parse_days("不限") == "all")
+    check("脏值按不限处理", schedule.normalize_days("???") == "all")
+    check("工作日规则在休息日不生效", not schedule.day_allowed("workday", False))
+    check("工作日规则在工作日生效", schedule.day_allowed("workday", True))
+    check("休息日规则反过来", schedule.day_allowed("restday", True) is False)
+    check("拿不到日历时带条件的规则不生效", not schedule.day_allowed("workday", None))
+
+    rule = parse_rule(["每天", "07:30", "内容=now", "日=工作日"])
+    check("规则能解析 日=工作日", rule.get("days") == "workday", str(rule))
+    check(
+        "描述里带日条件", "仅工作日" in schedule.describe_rule(rule), schedule.describe_rule(rule)
+    )
+
+    window = schedule.parse_window(["工作日", "08:00-18:00"])
+    check(
+        "时段能带日条件",
+        window == {"start": "08:00", "end": "18:00", "days": "workday"},
+        str(window),
+    )
+    glued = schedule.parse_window(["工作日08:00-18:00"])
+    check("漏空格也能认", glued["days"] == "workday" and glued["start"] == "08:00", str(glued))
+    check("后缀写法也认", schedule.parse_window(["09:00-18:00", "休息日"])["days"] == "restday")
+    check("时段描述带前缀", schedule.window_text([window]) == "仅工作日 08:00-18:00")
+    now = datetime(2026, 10, 31, 10, 0)  # 周六
+    check("休息日不落在工作日时段", not schedule.in_windows(now, [window], False))
+    check("工作日落在时段内", schedule.in_windows(now.replace(day=30), [window], True))
+    check(
+        "老时段（无 days）照旧全天有效",
+        schedule.in_windows(now, [{"start": "00:00", "end": "23:59"}], False),
+    )
+    check("空时段等于不限制", schedule.in_windows(now, [], False))
+
+    # 下次触发不能算到休息日
+    quiet = {"kind": "clock", "at": "07:30", "content": ["now"], "days": "workday"}
+    runs = schedule.next_runs(
+        quiet, datetime(2026, 10, 30, 8, 0), None, limit=1, day_filter=lambda d: d.weekday() < 5
+    )
+    check("仅工作日的规则跳到周一", bool(runs) and runs[0].weekday() == 0, str(runs))
+
+    from astrbot_plugin_qweather.qw.commands import _parse_day_text
+
+    base = date(2026, 10, 30)
+    check("日期：明天", _parse_day_text("明天", base) == date(2026, 10, 31))
+    check("日期：MM-DD", _parse_day_text("11-01", base) == date(2026, 11, 1))
+    check("日期：YYYY-MM-DD", _parse_day_text("2027-01-01", base) == date(2027, 1, 1))
+    check("日期：斜杠也认", _parse_day_text("2027/1/1", base) == date(2027, 1, 1))
+    check("日期：乱写返回 None", _parse_day_text("下下周", base) is None)
+
+
+def test_quota_push() -> None:
+    section("额度推送：按会话走、用会话 key、支持日条件")
+
+    from astrbot_plugin_qweather.qw.pushers import Pusher
+    from astrbot_plugin_qweather.qw.store import SubStore
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def finance_summary(self):
+            self.calls += 1
+            return {
+                "balance": "12.34",
+                "currency": "CNY",
+                "asOf": "2026-10-30T01:00:00Z",
+                "accruedCharges": {"thisMonth": "0.50", "previousDay": "0.02"},
+                "availableResourcePlans": [],
+                "pendingBills": [],
+            }
+
+        async def metrics_stats(self):
+            return {
+                "asOf": "2026-10-30T01:00:00Z",
+                "success": [{"api": "weather", "hours": [1, 2, 3]}],
+                "errors": [],
+            }
+
+    class FakeKeys:
+        def __init__(self, source: str) -> None:
+            self.source = source
+            self.asked: list[str] = []
+
+        async def resolve(self, umo: str):
+            self.asked.append(umo)
+            return types.SimpleNamespace(source=self.source)
+
+    class FakeCal:
+        def __init__(self, work: bool) -> None:
+            self.work = work
+
+        def is_workday(self, day) -> bool:
+            return self.work
+
+        def kick(self, *a, **k) -> None:
+            return None
+
+    async def run() -> None:
+        path = HERE / "_test_data" / "quota_push_test.json"
+        if path.exists():
+            path.unlink()
+        store = SubStore(path)
+        await store.load()
+        at = datetime.now().strftime("%H:%M")
+
+        # 只配额度推送、没有任何地址的会话也要能正常工作
+        await store.add_quota_rule("test:GroupMessage:q1", {"kind": "clock", "at": at})
+        await store.add_quota_rule(
+            "test:GroupMessage:q2", {"kind": "clock", "at": at, "days": "workday"}
+        )
+
+        sent: list[tuple[str, str]] = []
+
+        async def send(umo: str, text: str) -> bool:
+            sent.append((umo, text))
+            return True
+
+        client = FakeClient()
+
+        async def factory(_umo: str):
+            return client
+
+        keys = FakeKeys("session")
+        pusher = Pusher(store, keys, factory, send, FakeCal(False))
+
+        await pusher._tick()
+        check("休息日只推不限日条件的那条", len(sent) == 1, f"实际 {len(sent)} 条")
+        check("推给对了会话", sent[0][0] == "test:GroupMessage:q1")
+        check("内容是额度报告", "账户余额" in sent[0][1] and "12.34" in sent[0][1], sent[0][1][:80])
+        check("标明用的是会话 key", "本会话专用 key" in sent[0][1], sent[0][1][:80])
+        check("确实查了会话 key", keys.asked == ["test:GroupMessage:q1"], str(keys.asked))
+
+        await pusher._tick()
+        check("同一分钟不重推", len(sent) == 1, f"实际 {len(sent)} 条")
+
+        # 换到工作日：剩下那条才会推
+        sent.clear()
+        pusher2 = Pusher(store, keys, factory, send, FakeCal(True))
+        await pusher2._tick()
+        check("工作日推工作日那条", len(sent) == 1 and sent[0][0] == "test:GroupMessage:q2")
+        check("普通那条不重复推", all("q1" not in u for u, _ in sent))
+
+        # 默认 key 时说「系统默认 key」
+        keys2 = FakeKeys("default")
+        sent.clear()
+        store2 = SubStore(path)
+        await store2.load()
+        await store2.add_quota_rule("test:GroupMessage:q3", {"kind": "clock", "at": at})
+        pusher3 = Pusher(store2, keys2, factory, send, FakeCal(True))
+        await pusher3._tick()
+        check("默认 key 也能推", len(sent) == 1, f"实际 {len(sent)} 条")
+        check("标明用的是系统默认 key", "系统默认 key" in sent[0][1], sent[0][1][:80])
+
+        # 增删改开
+        rules = await store.quota_rules("test:GroupMessage:q2")
+        check("规则有 id 且不是纯数字", rules and not rules[0]["id"].isdigit())
+        await store.update_quota_rule("test:GroupMessage:q2", rules[0]["id"], {"enabled": False})
+        check("能关掉", (await store.quota_rules("test:GroupMessage:q2"))[0]["enabled"] is False)
+        check(
+            "按序号也能找到", (await store.find_quota_rule("test:GroupMessage:q2", "1")) is not None
+        )
+        check("删掉", await store.delete_quota_rule("test:GroupMessage:q2", rules[0]["id"]))
+        check("删完为空", await store.quota_rules("test:GroupMessage:q2") == [])
+
+        # 老数据没有 quota 字段也不能炸
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["sessions"]["test:GroupMessage:old"] = {"active": "", "locations": []}
+        path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        store3 = SubStore(path)
+        await store3.load()
+        check("老会话补上额度结构", (await store3.quota("test:GroupMessage:old"))["rules"] == [])
+
+    asyncio.run(run())
 
 
 def test_keys() -> None:
@@ -1052,6 +1341,13 @@ def test_plugin_class() -> None:
     from astrbot_plugin_qweather.main import QWeatherPlugin
     from astrbot_plugin_qweather.qw import naming
 
+    # 插件实例会往 _test_data 里写 subs.json。上一次运行留下的规则会让「列规则」的断言
+    # 时好时坏，先清干净，保证这套测试可以反复跑。
+    for stale_name in ("subs.json", "keys.json", "workdays.json"):
+        stale = HERE / "_test_data" / "astrbot_plugin_qweather" / stale_name
+        if stale.exists():
+            stale.unlink()
+
     naming.set_prefix("qweather")
     check("地点粗筛：天津", QWeatherPlugin._looks_like_place("天津"))
     check("地点粗筛：挡掉问句", not QWeatherPlugin._looks_like_place("天气怎么样？"))
@@ -1117,6 +1413,12 @@ def test_plugin_class() -> None:
         check("子指令能落到具体实现", "地址" in out, out[:80])
         out = "".join(asyncio.run(run_message("/qw 额度")))
         check("额度查询不崩（无网络时给错误提示）", bool(out), out[:80])
+        out = "".join(asyncio.run(run_message("/qw 工作日")))
+        check("工作日子指令能响应", "工作日" in out, out[:80])
+        out = "".join(asyncio.run(run_message("/qw 额度推送")))
+        check("额度推送子指令给帮助", "额度推送 加" in out, out[:80])
+        out = "".join(asyncio.run(run_message("/qw 额度 推送 加 每天 09:00")))
+        check("额度 推送 也能转发", "已添加" in out, out[:80])
     except Exception as exc:  # noqa: BLE001 构造失败就是部署会炸，必须暴露
         check("插件可实例化", False, f"{type(exc).__name__}: {exc}")
     finally:
@@ -1164,6 +1466,9 @@ def main() -> int:
     test_coord()
     test_address_cmds()
     test_pusher()
+    test_workday()
+    test_day_rules()
+    test_quota_push()
     test_keys()
     test_render()
     test_naming()
