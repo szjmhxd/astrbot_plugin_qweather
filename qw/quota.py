@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from typing import Any
 
 from .client import QWeatherClient, QWeatherError
+from .cost import addon_lines
 from .usage import UsageLedger
 
 # 控制台 API 默认是关的，两个接口都会 403。提示写一次，省得用户到处找。
@@ -36,6 +38,14 @@ PERMISSION_HINT = (
 
 def _thousands(value: int) -> str:
     return f"{value:,}"
+
+
+def _money(value: Any) -> float:
+    """``"1.53"`` / ``1.53`` / ``None`` → 1.53 / 0.0。财务接口的金额是字符串。"""
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _api_line(row: dict, label: str, limit: int = 5) -> str:
@@ -98,6 +108,7 @@ async def build_report(
     moment = now or datetime.now()
     lines: list[str] = []
     errors: list[str] = []
+    month_charge = 0.0
 
     if key_note:
         lines.append(f"凭据：{key_note}")
@@ -113,6 +124,7 @@ async def build_report(
         currency = finance.get("currency") or ""
         lines.append(f"账户余额：{finance.get('balance')} {currency}（数据截至 {as_of} UTC）")
         charges = finance.get("accruedCharges") or {}
+        month_charge = _money(charges.get("thisMonth"))
         lines.append(
             f"应计费用：本月 {charges.get('thisMonth', '-')}　"
             f"昨日 {charges.get('previousDay', '-')}"
@@ -130,6 +142,13 @@ async def build_report(
         unpaid = [b for b in bills if b.get("status") == "unpaid"]
         if unpaid:
             lines.append(f"待付账单：{len(unpaid)} 笔")
+
+    # 账单上有钱时，第一反应都是「插件是不是在偷偷花钱」。这里当场把话说清：
+    # 插件只用基础档，费用来自增值产品，去控制台按产品核对。
+    if month_charge > 0:
+        lines.append("")
+        lines.append(f"本月已应计 {month_charge:.2f} 元，而插件的请求都在免费档内：")
+        lines.extend(addon_lines())
 
     try:
         stats = await client.metrics_stats()

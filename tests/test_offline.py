@@ -2082,6 +2082,62 @@ def test_v16() -> None:
     check("空行被跳过", len(rows) == 2, str(rows))
 
 
+def test_billing() -> None:
+    """v1.6.2：账单上有钱时，报告要当场说清「插件只用免费档」。
+
+    真实账单：天气和基础服务 344 次 0.00 元；台风和海洋 10 次 0.03 元；
+    太阳辐照 5 次 1.50 元。单价就是从这里反推出来的。
+    """
+    from astrbot_plugin_qweather.qw import quota
+    from astrbot_plugin_qweather.qw.cost import ADDONS, addon_lines, estimate_session, render
+
+    section("计费口径：增值产品单独收费")
+    price = {name: value for name, value, _ in ADDONS}
+    check("记下台风和海洋", "台风和海洋" in price, str(list(price)))
+    check("记下太阳辐照", "太阳辐照" in price, str(list(price)))
+    check("太阳辐照 0.30 元/次", abs(price["太阳辐照"] - 0.30) < 1e-9, str(price))
+    check("台风和海洋 0.003 元/次", abs(price["台风和海洋"] - 0.003) < 1e-9, str(price))
+    note = "\n".join(addon_lines())
+    check("点出辐照贵得离谱", "5 次就 1.50 元" in note, note[:60])
+    check("给出归因", "不是本插件" in note, note[-40:])
+
+    section("成本估算带上计费提示")
+    text = render(estimate_session({"locations": [], "quota": {"rules": []}}))
+    check("估算里有增值产品段", "太阳辐照" in text, text[-100:])
+    check("没算错的免费额度还在", "免费" in text, text[:200])
+
+    section("额度报告：有应计费用才解释来源")
+
+    class FakeFinance:
+        def __init__(self, month: str) -> None:
+            self.month = month
+
+        async def finance_summary(self):
+            return {
+                "balance": "8.47",
+                "currency": "CNY",
+                "asOf": "2026-11-01T02:00:00Z",
+                "accruedCharges": {"thisMonth": self.month, "previousDay": "0.00"},
+                "availableResourcePlans": [],
+                "pendingBills": [],
+            }
+
+        async def metrics_stats(self):
+            return {"asOf": "2026-11-01T02:00:00Z", "success": [], "errors": []}
+
+    paid = asyncio.run(quota.build_report(FakeFinance("1.53"), now=datetime(2026, 11, 1, 12, 0)))
+    check("金额补到两位", "本月已应计 1.53 元" in paid, paid[:120])
+    check("点名太阳辐照", "太阳辐照" in paid, paid[:160])
+    check("说清不是插件", "不是本插件" in paid, paid[:160])
+
+    free = asyncio.run(quota.build_report(FakeFinance("0.00"), now=datetime(2026, 11, 1, 12, 0)))
+    check("没花钱就不啰嗦", "太阳辐照" not in free, free[:120])
+
+    # 金额是字符串也要认；空值不能炸
+    check("字符串金额转成数", abs(quota._money("1.53") - 1.53) < 1e-9)
+    check("取不到当 0", quota._money(None) == 0.0)
+
+
 def main() -> int:
     test_jwt()
     test_schedule()
@@ -2098,6 +2154,7 @@ def main() -> int:
     test_quota_push()
     test_usage_ledger()
     test_cost()
+    test_billing()
     test_keys()
     test_config_reload()
     test_render()
