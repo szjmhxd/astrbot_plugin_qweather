@@ -2100,6 +2100,8 @@ def test_billing() -> None:
     note = "\n".join(addon_lines())
     check("点出辐照贵得离谱", "5 次就 1.50 元" in note, note[:60])
     check("给出归因", "不是本插件" in note, note[-40:])
+    check("承认开发探针也算来源", "探针" in note, note[:200])
+    check("给出根治办法", "指定数据" in note and "取消勾选" in note, note[-80:])
 
     section("成本估算带上计费提示")
     text = render(estimate_session({"locations": [], "quota": {"rules": []}}))
